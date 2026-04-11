@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import pyqtgraph as pg; import inspect; print\\(inspect.signature\\(pg.PlotWidget.setXRange\\)\\)\")"
+    ]
+  }
+}
