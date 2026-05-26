@@ -270,8 +270,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ring_filt: np.ndarray = np.zeros((HISTORY, CHANNEL_COUNT), dtype=np.float32)
         self._disp:      np.ndarray = np.zeros((HISTORY, CHANNEL_COUNT), dtype=np.float32)
         self._snap:      np.ndarray = np.zeros((HISTORY, CHANNEL_COUNT), dtype=np.float64)
-        self._ring_ptr:  int        = 0
-        self._n_samples: int        = 0
+        self._ring_ptr:    int        = 0
+        self._n_samples:   int        = 0
+        self._plot_samples: int       = HISTORY   # how many samples to show; FFT always uses HISTORY
+        self._t_axis:      np.ndarray = np.linspace(-WINDOW_TIME, 0.0, HISTORY, dtype=np.float32)
 
         # Measured FS
         self._fs_meas:    float       = SAMPLE_RATE
@@ -313,6 +315,7 @@ class MainWindow(QtWidgets.QMainWindow):
         root.setContentsMargins(6, 6, 6, 6)
         root.addLayout(self._build_toolbar())
         root.addWidget(self._build_plot_panel(), stretch=1)
+        self._plot.setXRange(-WINDOW_TIME, 0.0)
 
     def _build_toolbar(self) -> QtWidgets.QHBoxLayout:
         bar = QtWidgets.QHBoxLayout()
@@ -354,15 +357,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self._drop_lbl.setStyleSheet('color: #aaa;')
         f2 = self._drop_lbl.font(); f2.setFamily('Consolas'); self._drop_lbl.setFont(f2)
 
+        self._plot_len_edit = QtWidgets.QLineEdit(f'{WINDOW_TIME:.2g}')
+        self._plot_len_edit.setFixedWidth(55)
+        self._plot_len_edit.setToolTip(
+            'Time-domain plot length in seconds (press Enter). '
+            'FFT always uses the full ring buffer.'
+        )
+        self._plot_len_edit.returnPressed.connect(self._on_plot_len_edit)
+
         for w in (
             QtWidgets.QLabel('Port:'), self._port_combo, refresh_btn,
             QtWidgets.QLabel('Baud:'), self._baud_combo,
             QtWidgets.QLabel('FSR:'),  self._fsr_combo,
             self._connect_btn, self._status_lbl, self._fs_lbl, self._drop_lbl,
+            QtWidgets.QLabel('Plot (s):'), self._plot_len_edit,
         ):
             bar.addWidget(w)
         bar.addStretch()
         return bar
+
+    def _on_plot_len_edit(self) -> None:
+        try:
+            secs = float(self._plot_len_edit.text())
+        except ValueError:
+            return
+        secs = max(0.0001, min(secs, WINDOW_TIME))
+        self._plot_samples = int(secs * SAMPLE_RATE)
+        self._plot.setXRange(-secs, 0.0)
 
     def _build_plot_panel(self) -> QtWidgets.QWidget:
         widget = QtWidgets.QWidget()
@@ -378,7 +399,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Time-series
         self._plot = pg.PlotWidget()
         self._plot.setLabel('left', 'Acceleration (g)')
-        self._plot.setLabel('bottom', 'Samples')
+        self._plot.setLabel('bottom', 'Time (s)')
         self._plot.showGrid(x=True, y=True, alpha=0.2)
         self._plot.setDownsampling(mode='peak')
         self._plot.setClipToView(True)
@@ -559,9 +580,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._disp[:HISTORY - p] = self._ring[p:]
         self._disp[HISTORY - p:] = self._ring[:p]
 
+        n  = self._plot_samples
+        t  = self._t_axis[-n:]
         for idx, name in enumerate(CHANNEL_NAMES):
             if self._curves[name].isVisible():
-                self._curves[name].setData(self._disp[:, idx])
+                self._curves[name].setData(t, self._disp[-n:, idx])
 
         if self._psd is not None:
             mask = self._plot_mask
