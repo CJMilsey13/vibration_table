@@ -43,6 +43,7 @@
 #define ICM_REG_INT_STATUS      0x2Du   /* bit 3 = UI_DRDY_INT */
 #define ICM_REG_INTF_CONFIG1    0x4Du   /* [1:0] CLKSEL; default 0x91 */
 #define ICM_REG_PWR_MGMT0       0x4Eu
+#define ICM_REG_GYRO_CONFIG0    0x4Fu   /* [7:5] GYRO_FS_SEL  [3:0] GYRO_ODR */
 #define ICM_REG_ACCEL_CONFIG0   0x50u
 #define ICM_REG_INT_CONFIG      0x14u
 #define ICM_REG_INT_SOURCE0     0x65u
@@ -60,9 +61,9 @@
 #define ICM_ACCEL_FS_SEL_8G     (0x01u << 5)   /* ±8 g   — 4096 LSB/g */
 #define ICM_ACCEL_FS_SEL_4G     (0x02u << 5)   /* ±4 g   — 8192 LSB/g */
 #define ICM_ACCEL_FS_SEL_2G     (0x03u << 5)   /* ±2 g   — 16384 LSB/g */
-#define ICM_ACCEL_ODR_1K        0x06u
+#define ICM_ACCEL_ODR_8K        0x03u
 
-#define ICM_ACCEL_CONFIG        (ICM_ACCEL_FS_SEL_16G | ICM_ACCEL_ODR_1K)
+#define ICM_ACCEL_CONFIG        (ICM_ACCEL_FS_SEL_16G | ICM_ACCEL_ODR_8K)
 
 /*
  * PWR_MGMT0 (0x4E):
@@ -212,10 +213,9 @@ static bool icm_init(void)
     icm_write(ICM_REG_INTF_CONFIG1, 0x91u);
     sleep_ms(1);
 
-    /* Configure ODR + FSR BEFORE enabling the accel — datasheet-recommended order.
-     * NOTE: ACCEL_CONFIG0 reset default is 0x06 = ICM_ACCEL_CONFIG (±16 g / 1 kHz),
-     * so readback would always pass; omitted. */
-    icm_write(ICM_REG_ACCEL_CONFIG0, ICM_ACCEL_CONFIG);
+    /* Configure ODR + FSR BEFORE enabling — datasheet-recommended order. */
+    icm_write(ICM_REG_ACCEL_CONFIG0, ICM_ACCEL_CONFIG);   /* ±16 g, 8 kHz */
+    icm_write(ICM_REG_GYRO_CONFIG0,  0x03u);              /* ±2000 dps, 8 kHz */
     sleep_ms(1);
 
     /* Enable accel + gyro LN AFTER configuring ODR/FSR.
@@ -287,9 +287,9 @@ static void read_and_push(void)
 /* ── Core 1: USB CDC output ─────────────────────────────────────────────────── */
 /*
  * Batches WRITE_BATCH frames into a single fwrite to reduce mutex overhead.
- * At 8 kHz, WRITE_BATCH=16 → 500 fwrite calls/s, each 160 bytes (2.5 USB packets).
+ * At 8 kHz, WRITE_BATCH=64 → 125 fwrite calls/s, each 640 bytes (~10 USB packets).
  */
-#define WRITE_BATCH  16u
+#define WRITE_BATCH  64u
 
 static void core1_main(void)
 {
@@ -337,9 +337,7 @@ int main(void)
     stdio_usb_init();
     stdio_set_translate_crlf(&stdio_usb, false);   /* binary output — no CR/LF translation */
 
-    /* 1 MHz — conservative for cheap breakout boards with onboard level shifters.
-     * Increase toward 8 MHz once data is confirmed valid. */
-    spi_init(SPI_PORT, 1u * 1000u * 1000u);
+    spi_init(SPI_PORT, 8u * 1000u * 1000u);   /* 8 MHz — 7-byte burst = 7 µs, well within 125 µs ODR period */
     /* ICM-42688-P supports Mode 0 and Mode 3; Mode 0 used here */
     spi_set_format(SPI_PORT, 8u, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
 
@@ -357,12 +355,12 @@ int main(void)
 
     multicore_launch_core1(core1_main);
 
-    /* Polling loop — read one sample every 1000 µs (= 1 kHz).
-     * SPI burst takes ~56 µs at 1 MHz, leaving ~944 µs of margin. */
+    /* Polling loop — read one sample every 125 µs (= 8 kHz).
+     * SPI burst takes ~7 µs at 8 MHz, leaving ~118 µs of margin. */
     uint64_t next = time_us_64();
     while (true) {
         read_and_push();
-        next += 1000u;
+        next += 125u;
         while (time_us_64() < next) tight_loop_contents();
     }
 }

@@ -39,14 +39,14 @@ CHANNEL_DICT: dict[str, tuple[int, int, int]] = {
 CHANNEL_COUNT = len(CHANNEL_DICT)
 CHANNEL_NAMES = list(CHANNEL_DICT.keys())
 
-SAMPLE_RATE = 1000.0          # nominal — updated live from timestamps
+SAMPLE_RATE = 8000.0          # nominal — updated live from timestamps
 WINDOW_TIME = 2.0             # seconds of history kept / fed to Welch
-HISTORY     = int(SAMPLE_RATE * WINDOW_TIME)   # 2 000 samples
+HISTORY     = int(SAMPLE_RATE * WINDOW_TIME)   # 16 000 samples
 
-SPEC_N   = 1000    # Welch segment = 1 s → 1 Hz resolution; ~3 averaged segments
-BATCH    = 10      # samples per signal emission → 100 signals/s at 1 kHz
+SPEC_N   = 8000    # Welch segment = 1 s → 1 Hz resolution; ~3 averaged segments
+BATCH    = 80      # samples per signal emission → 100 signals/s at 8 kHz
 PSD_FMIN = 5.0     # Hz — PSD + filter lower bound
-PSD_FMAX = 500.0   # Hz — Nyquist at 1 kHz
+PSD_FMAX = 4000.0  # Hz — Nyquist at 8 kHz
 
 # Frame: 0xAA 0x55 | seq uint16 LE | ax int16 LE | ay int16 LE | az int16 LE
 SYNC_A, SYNC_B = 0xAA, 0x55
