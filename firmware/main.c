@@ -67,13 +67,13 @@
 /*
  * PWR_MGMT0 (0x4E):
  *   [3:2] ACCEL_MODE  11=Low-Noise  10=Low-Power
- *   [1:0] GYRO_MODE   00=off
- * LP used here: LN mode draws more current and requires better VDD decoupling than
- * cheap breakout boards provide — LN causes the ADC to stall (0x8000 sentinel).
- * LP uses the wake-up oscillator, tolerates weaker decoupling, and still delivers
- * up to 1 kHz ODR (high-power LP = ACCEL_MODE=10 in datasheet Table 4-17).
+ *   [1:0] GYRO_MODE   11=Low-Noise  00=off
+ *
+ * Accel LN + Gyro LN (0x0F): enabling the gyro starts the shared PLL which the
+ * accel ADC requires. Accel-only modes (0x0C / 0x08) stall the ADC at 0x8000.
+ * Gyro data is produced but not transmitted — only accel frames are streamed.
  */
-#define ICM_PWR_ACCEL_LP_GYRO_OFF  0x08u   /* Low-Power mode */
+#define ICM_PWR_ACCEL_LN_GYRO_LN  0x0Fu
 
 /*
  * INT_CONFIG (0x14) bits [2:0] for INT1:
@@ -218,10 +218,11 @@ static bool icm_init(void)
     icm_write(ICM_REG_ACCEL_CONFIG0, ICM_ACCEL_CONFIG);
     sleep_ms(1);
 
-    /* Enable accel Low-Power mode AFTER configuring ODR/FSR */
-    icm_write(ICM_REG_PWR_MGMT0, ICM_PWR_ACCEL_LP_GYRO_OFF);
-    sleep_ms(10);
-    if (icm_read_byte(ICM_REG_PWR_MGMT0) != ICM_PWR_ACCEL_LP_GYRO_OFF)
+    /* Enable accel + gyro LN AFTER configuring ODR/FSR.
+     * Gyro LN starts the shared PLL; accel ADC requires it to convert. */
+    icm_write(ICM_REG_PWR_MGMT0, ICM_PWR_ACCEL_LN_GYRO_LN);
+    sleep_ms(50);   /* datasheet: up to 30 ms for analog chain; 50 ms for margin */
+    if (icm_read_byte(ICM_REG_PWR_MGMT0) != ICM_PWR_ACCEL_LN_GYRO_LN)
         blink_fault(3);   /* never returns */
 
     /* Poll INT_STATUS for UI_DRDY (bit 3).
