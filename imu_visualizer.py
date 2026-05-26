@@ -6,15 +6,20 @@ Usage:
   python imu_visualizer.py --demo       # run with simulated data (no hardware)
 
 Requirements:  pip install pyqtgraph PyQt5 pyserial numpy scipy
+Hardware:      ICM-42688-P via SPI → Pimoroni Pico Plus 2 (RP2350) → USB CDC
+
+Wire protocol (firmware → host):
+  [0xAA][0x55] | seq uint16 LE | ax int16 LE | ay int16 LE | az int16 LE
+  = 10 bytes per sample at 8 kHz nominal
 """
 
-from __future__ import annotations #https://cjmilsey.atlassian.net/wiki/spaces/PP/pages/121438209/Forward+References+from+__future__+import+annotations
+from __future__ import annotations  # https://cjmilsey.atlassian.net/wiki/spaces/PP/pages/121438209/Forward+References+from+__future__+import+annotations
 
-import argparse #parse input arguments
+import argparse
 import math
 import struct
 import sys
-from typing import Optional #more syntax cleanup, confused chris
+from typing import Optional
 
 import numpy as np
 import pyqtgraph as pg
@@ -26,37 +31,45 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-CHANEL_DICT: dict[str, tuple[int, int, int]] = {
+CHANNEL_DICT: dict[str, tuple[int, int, int]] = {
     'Accel X': (255, 200,   0),
     'Accel Y': (210,  80, 255),
     'Accel Z': (  0, 215, 215),
 }
-CHANEL_COUNT     = len(CHANEL_DICT)
-CHANEL_NAMES = list(CHANEL_DICT.keys())
+CHANNEL_COUNT = len(CHANNEL_DICT)
+CHANNEL_NAMES = list(CHANNEL_DICT.keys())
 
-SAMPLE_RATE       = 500.0    # nominal sample rate — updated live from timestamps
-WINDOW_TIME = 2.0
-WINDOW_SAMPLES  =   SAMPLE_RATE*WINDOW_TIME
+SAMPLE_RATE = 1000.0          # nominal — updated live from timestamps
+WINDOW_TIME = 2.0             # seconds of history kept / fed to Welch
+HISTORY     = int(SAMPLE_RATE * WINDOW_TIME)   # 2 000 samples
 
+SPEC_N   = 1000    # Welch segment = 1 s → 1 Hz resolution; ~3 averaged segments
+BATCH    = 10      # samples per signal emission → 100 signals/s at 1 kHz
+PSD_FMIN = 5.0     # Hz — PSD + filter lower bound
+PSD_FMAX = 500.0   # Hz — Nyquist at 1 kHz
 
-HISTORY  = 1000     # 2 s at 500 Hz — welch uses the full buffer
-SPEC_N   = 500      # welch segment length = 1 s; 3 averaged segments over HISTORY
-BATCH    = 10       # frames per signal emission → 50 signals/s
-PSD_FMIN = 5.0      # Hz — fixed x-axis lower bound
-PSD_FMAX = 250.0    # Hz — fixed x-axis upper bound
-
-# Binary frame: 0xAA 0x55 + 3×float32 LE = 14 bytes
+# Frame: 0xAA 0x55 | seq uint16 LE | ax int16 LE | ay int16 LE | az int16 LE
 SYNC_A, SYNC_B = 0xAA, 0x55
-PAYLOAD_BYTES  = 12   # 3 × float32
+PAYLOAD_BYTES  = 8    # 2 (seq) + 6 (3×int16)
+
+# ICM-42688-P sensitivity in LSB/g for each FSR.
+# Select the entry that matches ICM_ACCEL_CONFIG in firmware/main.c.
+FSR_OPTIONS: dict[str, float] = {
+    '±16 g': 2048.0,
+    '±8 g':  4096.0,
+    '±4 g':  8192.0,
+    '±2 g': 16384.0,
+}
+FSR_DEFAULT = '±16 g'
 
 
 # ── Custom log-scale axis with plain-number tick labels ───────────────────────
 
 class LogHzAxis(pg.AxisItem):
     """
-    Log-scale x-axis whose tick labels show plain Hz values (5, 10, 50, 200)
-    instead of pyqtgraph's default '10^x' or scientific notation.
-    Data passed to curves must be log10(Hz).
+    Log-scale x-axis whose tick labels show plain Hz values (5, 10, 50, 1000 …)
+    instead of pyqtgraph's default '10^x' notation.
+    Curves must receive log10(Hz) as x data.
     """
     def tickStrings(self, values, scale, spacing):  # noqa: ARG002
         return [f'{10**v:.4g}' for v in values]
@@ -65,64 +78,81 @@ class LogHzAxis(pg.AxisItem):
 # ── Serial worker ─────────────────────────────────────────────────────────────
 
 class SerialWorker(QtCore.QThread):
-    """Reads binary frames, accumulates BATCH samples, emits (data, t0, t1)."""
-    batch_ready = QtCore.pyqtSignal(object, float, float)
+    """
+    Reads ICM-42688-P binary frames from USB CDC.
+    Emits (data_g float32, t0, t1, batch_drops) after BATCH samples.
+    Changing FSR requires disconnect + reconnect (sensitivity is fixed at construction).
+    """
+    batch_ready = QtCore.pyqtSignal(object, float, float, int)
 
-    def __init__(self, port: str, baud: int = 115200) -> None:
+    def __init__(self, port: str, baud: int, sensitivity: float) -> None:
         super().__init__()
-        self.port = port
-        self.baud = baud
-        self._running = False
+        self.port        = port
+        self.baud        = baud
+        self.sensitivity = sensitivity
+        self._running    = False
 
     def run(self) -> None:
         import time as _time
-        buf = np.empty((BATCH, chanel_count), dtype=np.float32)
-        idx = 0
-        t0  = 0.0
+
+        FRAME_BYTES = 2 + PAYLOAD_BYTES      # 10 bytes total
+        SYNC        = bytes([SYNC_A, SYNC_B])
+        READ_CHUNK  = 4096                   # bytes per read() call
+
+        buf      = np.empty((BATCH, CHANNEL_COUNT), dtype=np.float32)
+        idx      = 0
+        t0       = 0.0
+        drops    = 0
+        last_seq: Optional[int] = None
+        scale    = 1.0 / self.sensitivity
+        pending  = bytearray()
 
         try:
-            ser = serial.Serial(self.port, self.baud, timeout=1)
+            ser = serial.Serial(self.port, self.baud, timeout=0.1)
+            ser.set_buffer_size(rx_size=131072)   # 128 KB OS buffer
             self._running = True
 
-            # Sync to first frame boundary
             while self._running:
-                b = ser.read(1)
-                if b and b[0] == SYNC_A:
-                    b2 = ser.read(1)
-                    if b2 and b2[0] == SYNC_B:
+                # One large read instead of one per frame — far fewer syscalls
+                incoming = ser.read(READ_CHUNK)
+                if incoming:
+                    pending.extend(incoming)
+
+                # Parse every complete frame available in the buffer
+                while len(pending) >= FRAME_BYTES:
+                    # Find next sync header
+                    sync_pos = pending.find(SYNC)
+                    if sync_pos < 0:
+                        # No sync in buffer; keep last byte in case it's 0xAA
+                        pending = pending[-1:]
+                        break
+                    if sync_pos > 0:
+                        pending = pending[sync_pos:]
+
+                    if len(pending) < FRAME_BYTES:
                         break
 
-            while self._running:
-                payload = ser.read(PAYLOAD_BYTES)
-                if len(payload) != PAYLOAD_BYTES:
-                    continue
-                t = _time.monotonic()
+                    seq, ax, ay, az = struct.unpack('<H3h', pending[2:FRAME_BYTES])
+                    pending = pending[FRAME_BYTES:]
 
-                ax, ay, az = struct.unpack('<3f', payload)
-                if idx == 0:
-                    t0 = t
-                buf[idx, 0] = ax
-                buf[idx, 1] = ay
-                buf[idx, 2] = az
-                idx += 1
+                    if last_seq is not None:
+                        expected = (last_seq + 1) & 0xFFFF
+                        if seq != expected:
+                            drops += (seq - expected) & 0xFFFF
+                    last_seq = seq
 
-                if idx == BATCH:
-                    self.batch_ready.emit(buf.copy(), t0, t)
-                    idx = 0
+                    t = _time.monotonic()
+                    if idx == 0:
+                        t0 = t
+                    buf[idx, 0] = ax * scale
+                    buf[idx, 1] = ay * scale
+                    buf[idx, 2] = az * scale
+                    idx += 1
 
-                # Consume next sync bytes; re-scan byte-by-byte if lost
-                s = ser.read(2)
-                if len(s) == 2 and s[0] == SYNC_A and s[1] == SYNC_B:
-                    continue
-                # Sync lost — re-acquire
-                remaining = bytearray(s)
-                while self._running:
-                    b = ser.read(1)
-                    if not b:
-                        break
-                    remaining.append(b[0])
-                    if len(remaining) >= 2 and remaining[-2] == SYNC_A and remaining[-1] == SYNC_B:
-                        break
+                    if idx == BATCH:
+                        self.batch_ready.emit(buf.copy(), t0, t, drops)
+                        drops = 0
+                        idx   = 0
 
             ser.close()
         except serial.SerialException as exc:
@@ -136,31 +166,31 @@ class SerialWorker(QtCore.QThread):
 # ── Demo worker ───────────────────────────────────────────────────────────────
 
 class DemoWorker(QtCore.QThread):
-    """Synthetic 500 Hz data: 50 Hz + 75 Hz + 120 Hz peaks."""
-    batch_ready = QtCore.pyqtSignal(object, float, float)
+    """Synthetic 8 kHz data: 50 Hz + 120 Hz + 1 kHz peaks visible across the full PSD range."""
+    batch_ready = QtCore.pyqtSignal(object, float, float, int)
 
     def run(self) -> None:
         import time as _time
         self._running = True
         t   = 0.0
-        dt  = 1.0 / frequency_sampling
-        buf = np.empty((BATCH, chanel_count), dtype=np.float32)
+        dt  = 1.0 / SAMPLE_RATE
+        buf = np.empty((BATCH, CHANNEL_COUNT), dtype=np.float32)
         idx = 0
         t0  = _time.monotonic()
 
         while self._running:
             buf[idx, 0] = (0.5 * math.sin(2*math.pi*50*t)
-                         + 0.1 * math.sin(2*math.pi*120*t))
-            buf[idx, 1] =  0.3 * math.sin(2*math.pi*50*t + 1.0)
+                         + 0.1 * math.sin(2*math.pi*1000*t))
+            buf[idx, 1] =  0.3 * math.sin(2*math.pi*120*t + 1.0)
             buf[idx, 2] =  0.2 * math.sin(2*math.pi*75*t)
             t   += dt
             idx += 1
             if idx == BATCH:
                 t1 = _time.monotonic()
-                self.batch_ready.emit(buf.copy(), t0, t1)
+                self.batch_ready.emit(buf.copy(), t0, t1, 0)
                 idx = 0
                 t0  = t1
-                self.msleep(int(1000 * BATCH / frequency_sampling))
+                self.msleep(int(1000 * BATCH / SAMPLE_RATE))
 
     def stop(self) -> None:
         self._running = False
@@ -172,7 +202,7 @@ class DemoWorker(QtCore.QThread):
 class WelchRunnable(QtCore.QRunnable):
     """
     Runs scipy.signal.welch on a (HISTORY, N_CH) snapshot in a worker thread.
-    Uses 50% overlapping SPEC_N-length Hann segments — typically 3 averages.
+    Uses 50% overlapping SPEC_N-length Hann segments — ~3 averages at HISTORY=16k, SPEC_N=8k.
     """
 
     def __init__(self, snapshot: np.ndarray, fs: float, callback) -> None:
@@ -184,7 +214,7 @@ class WelchRunnable(QtCore.QRunnable):
 
     def run(self) -> None:
         results: list[np.ndarray] = []
-        for ch in range(chanel_count):
+        for ch in range(CHANNEL_COUNT):
             _, psd = scipy_welch(
                 self._snap[:, ch],
                 fs=self._fs,
@@ -204,7 +234,25 @@ class WelchRunnable(QtCore.QRunnable):
 
 
 # ── Main window ───────────────────────────────────────────────────────────────
-
+# Top-level application window.
+#
+# Responsibilities:
+#   - Owns and manages the background worker thread (SerialWorker or DemoWorker)
+#   - Maintains ring buffers for raw and bandpass-filtered IMU samples
+#   - Runs Welch PSD computation off the main thread via QThreadPool
+#   - Drives a 30 Hz display timer that redraws time-series and PSD plots
+#   - Handles serial port connection/disconnection and live FS estimation
+#
+# Key attributes:
+#   self.worker        — active background thread, or None if disconnected
+#   self._ring         — raw sample ring buffer        (HISTORY × N_CH)
+#   self._ring_filt    — filtered sample ring buffer   (HISTORY × N_CH)
+#   self._ring_ptr     — current write position in the ring buffers
+#   self._fs_meas      — live-measured sample rate (updated each batch)
+#   self._sensitivity  — ICM-42688-P LSB/g for the active FSR (set at connect time)
+#   self._total_drops  — cumulative sequence-number gaps since last connect
+#   self._psd          — most recent Welch PSD result, or None
+# ─────────────────────────────────────────────────────────────────────────────
 class MainWindow(QtWidgets.QMainWindow):
 
     _fft_done = QtCore.pyqtSignal(object)
@@ -214,31 +262,35 @@ class MainWindow(QtWidgets.QMainWindow):
         self.demo   = demo
         self.worker: Optional[SerialWorker | DemoWorker] = None
 
+        self._sensitivity  = FSR_OPTIONS[FSR_DEFAULT]
+        self._total_drops  = 0
+
         # Ring buffers
-        self._ring:      np.ndarray = np.zeros((HISTORY, chanel_count), dtype=np.float32)
-        self._ring_filt: np.ndarray = np.zeros((HISTORY, chanel_count), dtype=np.float32)
-        self._disp:      np.ndarray = np.zeros((HISTORY, chanel_count), dtype=np.float32)
-        self._snap:      np.ndarray = np.zeros((HISTORY, chanel_count), dtype=np.float64)
+        self._ring:      np.ndarray = np.zeros((HISTORY, CHANNEL_COUNT), dtype=np.float32)
+        self._ring_filt: np.ndarray = np.zeros((HISTORY, CHANNEL_COUNT), dtype=np.float32)
+        self._disp:      np.ndarray = np.zeros((HISTORY, CHANNEL_COUNT), dtype=np.float32)
+        self._snap:      np.ndarray = np.zeros((HISTORY, CHANNEL_COUNT), dtype=np.float64)
         self._ring_ptr:  int        = 0
         self._n_samples: int        = 0
 
         # Measured FS
-        self._fs_meas:    float      = frequency_sampling
+        self._fs_meas:    float       = SAMPLE_RATE
         self._fs_history: list[float] = []
 
-        # Bandpass filter (5–245 Hz) + initial freq arrays
-        self._sos, self._zi = self._build_filter(frequency_sampling)
-        self._update_freq_arrays(frequency_sampling)
+        # Bandpass filter (PSD_FMIN – ~98% Nyquist) + initial freq arrays
+        self._sos, self._zi = self._build_filter(SAMPLE_RATE)
+        self._update_freq_arrays(SAMPLE_RATE)
 
         # PSD state
         self._psd:         Optional[list[np.ndarray]] = None
         self._fft_running: bool = False
 
-        self._pool = QtCore.QThreadPool.globalInstance()
-        assert self._pool is not None
+        pool = QtCore.QThreadPool.globalInstance()
+        assert pool is not None
+        self._pool: QtCore.QThreadPool = pool
 
         self._build_ui()
-        self._fs_lbl.setText(f'FS: {frequency_sampling:.0f} Hz (configured)')
+        self._fs_lbl.setText(f'FS: {SAMPLE_RATE:.0f} Hz (configured)')
         self._fft_done.connect(self._on_fft_done)
 
         self._display_timer = QtCore.QTimer(self)
@@ -252,7 +304,7 @@ class MainWindow(QtWidgets.QMainWindow):
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
-        self.setWindowTitle('IMU Visualizer')
+        self.setWindowTitle('IMU Visualizer — ICM-42688-P')
         self.resize(1400, 900)
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -275,9 +327,15 @@ class MainWindow(QtWidgets.QMainWindow):
         refresh_btn.clicked.connect(self._refresh_ports)
 
         self._baud_combo = QtWidgets.QComboBox()
-        for b in ('9600', '115200', '230400'):
+        for b in ('115200', '230400', '921600', '1000000'):
             self._baud_combo.addItem(b)
         self._baud_combo.setCurrentText('115200')
+
+        self._fsr_combo = QtWidgets.QComboBox()
+        for label in FSR_OPTIONS:
+            self._fsr_combo.addItem(label)
+        self._fsr_combo.setCurrentText(FSR_DEFAULT)
+        self._fsr_combo.setToolTip('Must match ICM_ACCEL_CONFIG in firmware — reconnect to apply')
 
         self._connect_btn = QtWidgets.QPushButton('Connect')
         self._connect_btn.setFixedWidth(95)
@@ -292,10 +350,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fs_lbl.setStyleSheet('color: #aaa;')
         f = self._fs_lbl.font(); f.setFamily('Consolas'); self._fs_lbl.setFont(f)
 
+        self._drop_lbl = QtWidgets.QLabel('Drops: 0')
+        self._drop_lbl.setStyleSheet('color: #aaa;')
+        f2 = self._drop_lbl.font(); f2.setFamily('Consolas'); self._drop_lbl.setFont(f2)
+
         for w in (
             QtWidgets.QLabel('Port:'), self._port_combo, refresh_btn,
             QtWidgets.QLabel('Baud:'), self._baud_combo,
-            self._connect_btn, self._status_lbl, self._fs_lbl,
+            QtWidgets.QLabel('FSR:'),  self._fsr_combo,
+            self._connect_btn, self._status_lbl, self._fs_lbl, self._drop_lbl,
         ):
             bar.addWidget(w)
         bar.addStretch()
@@ -321,17 +384,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._plot.setClipToView(True)
         self._plot.addLegend(offset=(8, 8))
 
-        # PSD — custom log-Hz x-axis, linear y (we pass dB values directly)
+        # PSD — custom log-Hz x-axis, linear y-axis (dB values passed directly)
         self._spec_plot = pg.PlotWidget(
             axisItems={'bottom': LogHzAxis(orientation='bottom')}
         )
-        self._spec_plot.setLogMode(x=True, y=False)   # x log via custom axis
+        self._spec_plot.setLogMode(x=True, y=False)
         self._spec_plot.setLabel('left', 'PSD  (dB  re g²/Hz)')
         self._spec_plot.setLabel('bottom', 'Frequency  (Hz)')
         self._spec_plot.showGrid(x=True, y=True, alpha=0.2)
         self._spec_plot.addLegend(offset=(8, 8))
         self._spec_plot.getAxis('left').enableAutoSIPrefix(False)
-        # Fixed x range passed as log10 values
         self._spec_plot.setXRange(
             math.log10(PSD_FMIN), math.log10(PSD_FMAX), padding=0
         )
@@ -339,7 +401,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._curves:      dict[str, pg.PlotDataItem] = {}
         self._spec_curves: dict[str, pg.PlotDataItem] = {}
 
-        for idx, (name, color) in enumerate(CHANEL_DICT.items()):
+        for idx, (name, color) in enumerate(CHANNEL_DICT.items()):
             self._curves[name] = self._plot.plot(
                 np.zeros(HISTORY), name=name,
                 pen=pg.mkPen(color=color, width=1.5),
@@ -378,20 +440,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @staticmethod
     def _build_filter(fs: float):
-        hp_freq = 5.0
-        lp_freq = min(245.0, fs / 2.0 - 5.0)
+        hp_freq = PSD_FMIN
+        lp_freq = min(PSD_FMAX - 5.0, fs * 0.49)   # stay clear of Nyquist
         sos      = butter(4, [hp_freq, lp_freq], btype='bandpass', fs=fs, output='sos')
         zi_proto = sosfilt_zi(sos)
-        zi       = np.stack([zi_proto] * chanel_count, axis=-1)
+        zi       = np.stack([zi_proto] * CHANNEL_COUNT, axis=-1)
         return sos, zi
 
     def _update_freq_arrays(self, fs: float) -> None:
-        """Recompute freq arrays and log-freq display arrays for given FS."""
-        freqs            = np.fft.rfftfreq(SPEC_N, 1.0 / fs)   # 0 … fs/2
+        freqs            = np.fft.rfftfreq(SPEC_N, 1.0 / fs)
         mask             = (freqs >= PSD_FMIN) & (freqs <= PSD_FMAX)
         self._plot_freqs = freqs[mask]
         self._plot_mask  = mask
-        # log10 values passed to the LogHzAxis curves
         self._log_plot_freqs = np.log10(self._plot_freqs)
 
     def _update_fs(self, fs: float) -> None:
@@ -415,7 +475,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.worker.stop()
             self.worker = None
             self._sos, self._zi = self._build_filter(self._fs_meas)
-            self._n_samples = 0
+            self._n_samples   = 0
+            self._total_drops = 0
+            self._drop_lbl.setText('Drops: 0')
+            self._drop_lbl.setStyleSheet('color: #aaa;')
             self._connect_btn.setText('Connect')
             self._status_lbl.setText('●  Disconnected')
             self._status_lbl.setStyleSheet('color: #888;')
@@ -424,7 +487,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if not port:
                 return
             baud = int(self._baud_combo.currentText())
-            self._start_worker(SerialWorker(port, baud))
+            sensitivity = FSR_OPTIONS[self._fsr_combo.currentText()]
+            self._sensitivity = sensitivity
+            self._start_worker(SerialWorker(port, baud, sensitivity))
             self._connect_btn.setText('Disconnect')
             self._status_lbl.setText(f'●  {port}')
             self._status_lbl.setStyleSheet('color: #4f4;')
@@ -439,8 +504,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ── Data pipeline ─────────────────────────────────────────────────────────
 
-    def _on_batch(self, batch: np.ndarray, t0: float, t1: float) -> None:
+    def _on_batch(self, batch: np.ndarray, t0: float, t1: float, drops: int) -> None:
         n = len(batch)
+
+        if drops:
+            self._total_drops += drops
+            self._drop_lbl.setText(f'Drops: {self._total_drops}')
+            self._drop_lbl.setStyleSheet('color: #f44;')
 
         # Live FS estimation — median of last 20 batch rates
         if t1 > t0:
@@ -450,7 +520,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if len(self._fs_history) >= 5:
                 self._update_fs(float(np.median(self._fs_history)))
 
-        # Bandpass filter (stateful — no edge transients, O(batch) cost)
+        # Bandpass filter (stateful — no edge transients)
         filt, self._zi = sosfilt(self._sos, batch, axis=0, zi=self._zi)
 
         # Write into ring buffers
@@ -471,7 +541,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _launch_welch(self) -> None:
         self._fft_running = True
-        # Unroll ring buffer into pre-allocated snapshot — no allocation
         p = self._ring_ptr
         self._snap[:HISTORY - p] = self._ring_filt[p:]
         self._snap[HISTORY - p:] = self._ring_filt[:p]
@@ -490,23 +559,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._disp[:HISTORY - p] = self._ring[p:]
         self._disp[HISTORY - p:] = self._ring[:p]
 
-        for idx, name in enumerate(chanel_names):
+        for idx, name in enumerate(CHANNEL_NAMES):
             if self._curves[name].isVisible():
                 self._curves[name].setData(self._disp[:, idx])
 
         if self._psd is not None:
             mask = self._plot_mask
             lf   = self._log_plot_freqs
-            for idx, name in enumerate(chanel_names):
+            for idx, name in enumerate(CHANNEL_NAMES):
                 if self._spec_curves[name].isVisible():
                     db = 10.0 * np.log10(self._psd[idx][mask])
                     self._spec_curves[name].setData(lf, db)
 
-    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+    def closeEvent(self, a0: QtGui.QCloseEvent | None) -> None:
         if self.worker:
             self.worker.stop()
         self._pool.waitForDone(1000)
-        super().closeEvent(event)
+        super().closeEvent(a0)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
