@@ -1,8 +1,9 @@
 /*
  * ICM-42688-P → RP2350 dual-core → USB CDC streamer
  * ==================================================
- * Core 0  Initialises IMU over SPI; handles INT1 GPIO interrupt at 8 kHz;
- *         pushes raw int16 triplets into a lock-free SPSC ring buffer.
+ * Core 0  Initialises IMU over SPI; polls it on a 125 µs timer (8 kHz) and
+ *         pushes raw int16 triplets, each stamped with a sequence number,
+ *         into a lock-free SPSC ring buffer. INT1 is NOT used.
  * Core 1  Drains the ring buffer; formats 10-byte binary frames;
  *         writes them to the host over USB CDC (stdio_usb).
  *
@@ -102,15 +103,24 @@
  * payload before it sees the updated index.
  *
  * RING_SIZE must be a power of 2.
- * 4096 entries × 6 bytes = 24 kB ≈ 512 ms headroom at 8 kHz.
+ * 4096 entries × 8 bytes = 32 kB ≈ 512 ms headroom at 8 kHz.
  */
 #define RING_SIZE  4096u
 
-typedef struct { int16_t ax, ay, az; } sample_t;
+typedef struct { int16_t ax, ay, az; uint16_t seq; } sample_t;
 
 static volatile sample_t ring_buf[RING_SIZE];
 static volatile uint32_t ring_wr = 0u;   /* written only by Core 0 */
 static volatile uint32_t ring_rd = 0u;   /* written only by Core 1 */
+
+/*
+ * Acquisition counter — Core 0 only. It advances for every sample READ from
+ * the IMU, whether or not that sample fits in the ring, and travels with the
+ * sample into the frame. A sample dropped on overrun therefore leaves a gap in
+ * the sequence the host sees, and the host's drop counter reports it.
+ * Numbering frames at transmit time instead would hide every overrun.
+ */
+static uint16_t acq_seq = 0u;
 
 static inline bool ring_full(void)
 {
@@ -119,11 +129,13 @@ static inline bool ring_full(void)
 
 static inline void ring_push(int16_t ax, int16_t ay, int16_t az)
 {
+    uint16_t seq = acq_seq++;
     if (ring_full()) return;   /* overrun — drop sample rather than block IRQ */
     uint32_t idx = ring_wr & (RING_SIZE - 1u);
-    ring_buf[idx].ax = ax;
-    ring_buf[idx].ay = ay;
-    ring_buf[idx].az = az;
+    ring_buf[idx].ax  = ax;
+    ring_buf[idx].ay  = ay;
+    ring_buf[idx].az  = az;
+    ring_buf[idx].seq = seq;
     __dmb();          /* payload visible before head advances */
     ring_wr++;
 }
@@ -132,9 +144,10 @@ static inline bool ring_pop(sample_t *out)
 {
     if (ring_wr == ring_rd) return false;
     uint32_t idx = ring_rd & (RING_SIZE - 1u);
-    out->ax = ring_buf[idx].ax;
-    out->ay = ring_buf[idx].ay;
-    out->az = ring_buf[idx].az;
+    out->ax  = ring_buf[idx].ax;
+    out->ay  = ring_buf[idx].ay;
+    out->az  = ring_buf[idx].az;
+    out->seq = ring_buf[idx].seq;
     __dmb();          /* payload read before tail advances */
     ring_rd++;
     return true;
@@ -297,7 +310,12 @@ static void core1_main(void)
     while (!stdio_usb_connected())
         sleep_ms(10);
 
-    uint16_t seq = 0u;
+    /* Core 0 has been sampling since boot, so the ring holds up to 512 ms of
+     * data from before the host connected. Discard it: the host should start
+     * with what the sensor is reading now. Core 1 is the only writer of
+     * ring_rd, so this is safe against Core 0's concurrent pushes. */
+    ring_rd = ring_wr;
+
     uint8_t  out[WRITE_BATCH * FRAME_BYTES];
     uint32_t out_idx = 0u;
     sample_t s;
@@ -311,15 +329,14 @@ static void core1_main(void)
         uint8_t *f = out + out_idx * FRAME_BYTES;
         f[0] = SYNC_A;
         f[1] = SYNC_B;
-        f[2] = (uint8_t)(seq);
-        f[3] = (uint8_t)(seq >> 8);
+        f[2] = (uint8_t)(s.seq);            /* stamped at acquisition, Core 0 */
+        f[3] = (uint8_t)(s.seq >> 8);
         f[4] = (uint8_t)(s.ax);
         f[5] = (uint8_t)((uint16_t)s.ax >> 8);
         f[6] = (uint8_t)(s.ay);
         f[7] = (uint8_t)((uint16_t)s.ay >> 8);
         f[8] = (uint8_t)(s.az);
         f[9] = (uint8_t)((uint16_t)s.az >> 8);
-        seq++;
         out_idx++;
 
         if (out_idx == WRITE_BATCH) {
