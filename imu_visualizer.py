@@ -16,7 +16,6 @@ Wire protocol (firmware → host):
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import struct
 import sys
@@ -27,11 +26,21 @@ import threading
 
 import numpy as np
 import pyqtgraph as pg
-from scipy.signal import butter, sosfilt, sosfilt_zi, welch as scipy_welch
-from scipy.ndimage import gaussian_filter1d
+from scipy.signal import welch as scipy_welch
 import serial
 import serial.tools.list_ports
 from PyQt5 import QtCore, QtGui, QtWidgets
+
+from control import (
+    CTRL_MAX_CUT_DB, SPEC_AVG_DEFAULT, SPEC_AVG_MAX, TOL_ABORT_DB, TOL_ALARM_DB,
+    ResponseError, SpecAssessor, SpecStatus, SpectralController,
+    band_grms, band_mask, breakpoint_error, psd_grms, psd_interp_loglog,
+)
+from sequence import SequenceRunner
+from stream import (
+    CTRL_WINDOW_S, DISPLAY_WELCH_HZ, HISTORY, PSD_FMAX, PSD_FMIN,
+    SAMPLE_RATE, SPEC_N, WINDOW_TIME, MeasurementStream, Window,
+)
 
 try:
     import sounddevice as _sd
@@ -42,6 +51,7 @@ except ImportError:
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
+# Measurement timing lives in stream.py, control-law tuning in control.py.
 
 CHANNEL_DICT: dict[str, tuple[int, int, int]] = {
     'Accel X': (255, 200,   0),
@@ -51,61 +61,9 @@ CHANNEL_DICT: dict[str, tuple[int, int, int]] = {
 CHANNEL_COUNT = len(CHANNEL_DICT)
 CHANNEL_NAMES = list(CHANNEL_DICT.keys())
 
-SAMPLE_RATE = 8000.0
-WINDOW_TIME = 10.0                          # max ring-buffer / display length
-HISTORY     = int(SAMPLE_RATE * WINDOW_TIME)  # 80 000 samples
-
-SPEC_N            = 8000   # 1 s segments → 1 Hz resolution
-
-# The control loop must see a FRESH, NON-OVERLAPPING measurement each update.
-# Welch therefore runs over the most recent CTRL_SAMPLES only, and is launched
-# only once that many new samples have arrived — so consecutive control updates
-# share no data. Measuring over the whole ring while updating every batch made
-# the loop react ~1000x faster than its own measurement could refresh, which
-# wound the correction to the clamp and produced a sustained limit cycle.
-CTRL_WINDOW_S     = 2.0
-CTRL_SAMPLES      = int(SAMPLE_RATE * CTRL_WINDOW_S)   # 16000 → 3 Welch averages
-WELCH_MIN_SAMPLES = CTRL_SAMPLES
-
-# Welch itself runs fast so the spectrum feels live; consecutive windows overlap
-# heavily, which is fine for display. The CONTROL update is gated separately on
-# CTRL_SAMPLES of new data, so it still only ever sees non-overlapping windows.
-DISPLAY_WELCH_HZ      = 15.0
-DISPLAY_WELCH_SAMPLES = max(1, int(SAMPLE_RATE / DISPLAY_WELCH_HZ))
 PSD_DISPLAY_TAU_S     = 0.35   # EMA time constant, display only — never control
 
-CTRL_DEADBAND_DB  = 0.5    # ≈1σ of the smoothed estimate; soft-thresholded
-CTRL_MAX_STEP_DB  = 6.0    # per-update slew limit on the correction
-
-# The clamp is ASYMMETRIC on purpose. Boosting a bin is legitimate whenever the
-# rig is simply inefficient there. Cutting is different: once a bin is ~30 dB
-# down it is effectively switched off, so if the measured level there has not
-# fallen, that energy is not coming from the drive at that frequency — it is the
-# structure ringing at resonance, or harmonics of some other bin. A resonant
-# plant is not diagonal, and no amount of further cutting nulls a cross-coupled
-# term; it only burns dynamic range and starves the bins that do respond.
-CTRL_MAX_CUT_DB   = 40.0   # deep enough for a genuine high-Q resonance, while
-                           # keeping boost+cut spread inside the DAC's ~96 dB
-
-# Slew is asymmetric. Moving AWAY from zero is limited to CTRL_MAX_STEP_DB so one
-# bad window cannot slam a bin to an extreme. Moving TOWARD zero is returning to
-# neutral — inherently safe — so it is allowed to unwind a full rail within
-# CTRL_RECOVERY_S. One control update is the floor: the loop cannot react faster
-# than it can measure.
-CTRL_RECOVERY_S    = 2.0
-CTRL_MAX_UNWIND_DB = CTRL_MAX_CUT_DB * CTRL_WINDOW_S / CTRL_RECOVERY_S
-
-# Overall level is a SEPARATE loop from spectral shape. The synthesised block is
-# normalised to unit RMS, so a common-mode (uniform) per-bin correction produces
-# exactly 0.00 dB of output change — it is divided straight back out. Only this
-# scalar can move the level. Splitting the error into common-mode (here) and
-# zero-mean (per-bin) also stops the shape loop winding every bin to the clamp
-# chasing a level deficit it structurally cannot fix.
-CTRL_LEVEL_MAX_STEP_DB = 6.0    # real physical level change — worth slew-limiting
-LEVEL_MIN_DB           = -80.0
 BATCH    = 80
-PSD_FMIN = 5.0
-PSD_FMAX = 4000.0
 PSD_FLOOR_LOG = -12.0   # log10(g²/Hz) placeholder for "no data yet"
 # Spectrum view window, in decades either side of the demand profile. Kept tight
 # on purpose: the ±6 dB tolerance band is only 0.6 of a decade, so a very wide
@@ -113,10 +71,6 @@ PSD_FLOOR_LOG = -12.0   # log10(g²/Hz) placeholder for "no data yet"
 PSD_VIEW_DECADES_BELOW = -4.0
 PSD_VIEW_DECADES_ABOVE =  1.0
 PSD_VIEW_MAX_DECADES   =  8.0   # hard cap, so a clamped bin can't blow the scale
-# Tolerance bands drawn around the demand profile (dB power), the usual way a
-# random-vibration run is judged in or out of spec.
-TOL_ALARM_DB = 3.0
-TOL_ABORT_DB = 6.0
 
 SYNC_A, SYNC_B = 0xAA, 0x55
 PAYLOAD_BYTES  = 8
@@ -146,40 +100,6 @@ DEFAULT_SEQUENCE: list[tuple[float, float]] = [   # (duration_s, gain_db)
 RESPONSE_FILE = Path(__file__).with_name('speaker_response.json')
 
 
-# ── PSD profile helpers ───────────────────────────────────────────────────────
-
-def psd_interp_loglog(
-    freqs: np.ndarray,
-    breakpoints: list[tuple[float, float]],
-    gain_db: float = 0.0,
-) -> np.ndarray:
-    """Log-log interpolate PSD breakpoints onto freqs; apply gain_db (power scale)."""
-    if len(breakpoints) < 2:
-        return np.full(len(freqs), 1e-30)
-    bf = np.array([b[0] for b in breakpoints], dtype=np.float64)
-    bp = np.array([b[1] for b in breakpoints], dtype=np.float64)
-    lf = np.clip(np.log10(freqs), np.log10(bf[0]), np.log10(bf[-1]))
-    lp = np.interp(lf, np.log10(bf), np.log10(bp))
-    return (10.0 ** lp) * (10.0 ** (gain_db / 10.0))
-
-
-def psd_grms(breakpoints: list[tuple[float, float]], gain_db: float = 0.0) -> float:
-    """Integrate log-log PSD profile analytically → Grms."""
-    if len(breakpoints) < 2:
-        return 0.0
-    gain    = 10.0 ** (gain_db / 10.0)
-    grms_sq = 0.0
-    for i in range(len(breakpoints) - 1):
-        f1, p1 = breakpoints[i][0],   breakpoints[i][1]   * gain
-        f2, p2 = breakpoints[i+1][0], breakpoints[i+1][1] * gain
-        m = math.log10(p2 / p1) / math.log10(f2 / f1)
-        if abs(m + 1.0) < 1e-9:
-            grms_sq += p1 * f1 * math.log(f2 / f1)
-        else:
-            grms_sq += p1 / (m + 1.0) * (f2**(m+1.0) - f1**(m+1.0)) / (f1**m)
-    return math.sqrt(max(grms_sq, 0.0))
-
-
 # ── Custom log-scale axis ─────────────────────────────────────────────────────
 
 class LogHzAxis(pg.AxisItem):
@@ -204,7 +124,8 @@ class LogPSDAxis(pg.AxisItem):
 # ── Serial worker ─────────────────────────────────────────────────────────────
 
 class SerialWorker(QtCore.QThread):
-    batch_ready = QtCore.pyqtSignal(object, float, float, int)
+    batch_ready = QtCore.pyqtSignal(object, int)   # samples, dropped frames
+    failed      = QtCore.pyqtSignal(str)           # port could not be opened / was lost
 
     def __init__(self, port: str, baud: int, sensitivity: float) -> None:
         super().__init__()
@@ -214,15 +135,12 @@ class SerialWorker(QtCore.QThread):
         self._running    = False
 
     def run(self) -> None:
-        import time as _time
-
         FRAME_BYTES = 2 + PAYLOAD_BYTES
         SYNC        = bytes([SYNC_A, SYNC_B])
         READ_CHUNK  = 4096
 
         buf      = np.empty((BATCH, CHANNEL_COUNT), dtype=np.float32)
         idx      = 0
-        t0       = 0.0
         drops    = 0
         last_seq: Optional[int] = None
         scale    = 1.0 / self.sensitivity
@@ -257,22 +175,19 @@ class SerialWorker(QtCore.QThread):
                             drops += (seq - expected) & 0xFFFF
                     last_seq = seq
 
-                    t = _time.monotonic()
-                    if idx == 0:
-                        t0 = t
                     buf[idx, 0] = ax * scale
                     buf[idx, 1] = ay * scale
                     buf[idx, 2] = az * scale
                     idx += 1
 
                     if idx == BATCH:
-                        self.batch_ready.emit(buf.copy(), t0, t, drops)
+                        self.batch_ready.emit(buf.copy(), drops)
                         drops = 0
                         idx   = 0
 
             ser.close()
         except serial.SerialException as exc:
-            print(f'Serial error: {exc}')
+            self.failed.emit(str(exc))
 
     def stop(self) -> None:
         self._running = False
@@ -283,16 +198,14 @@ class SerialWorker(QtCore.QThread):
 
 class DemoWorker(QtCore.QThread):
     """Synthetic 8 kHz data: 50 Hz + 120 Hz + 1 kHz peaks."""
-    batch_ready = QtCore.pyqtSignal(object, float, float, int)
+    batch_ready = QtCore.pyqtSignal(object, int)
 
     def run(self) -> None:
-        import time as _time
         self._running = True
         t   = 0.0
         dt  = 1.0 / SAMPLE_RATE
         buf = np.empty((BATCH, CHANNEL_COUNT), dtype=np.float32)
         idx = 0
-        t0  = _time.monotonic()
 
         while self._running:
             buf[idx, 0] = (0.5 * math.sin(2*math.pi*50*t)
@@ -302,10 +215,8 @@ class DemoWorker(QtCore.QThread):
             t   += dt
             idx += 1
             if idx == BATCH:
-                t1 = _time.monotonic()
-                self.batch_ready.emit(buf.copy(), t0, t1, 0)
+                self.batch_ready.emit(buf.copy(), 0)
                 idx = 0
-                t0  = t1
                 self.msleep(int(1000 * BATCH / SAMPLE_RATE))
 
     def stop(self) -> None:
@@ -318,10 +229,10 @@ class DemoWorker(QtCore.QThread):
 class WelchRunnable(QtCore.QRunnable):
     """50%-overlapping Hann-windowed Welch PSD, run in thread pool."""
 
-    def __init__(self, snapshot: np.ndarray, fs: float, callback) -> None:
+    def __init__(self, window: Window, fs: float, callback) -> None:
         super().__init__()
         self.setAutoDelete(True)
-        self._snap     = snapshot
+        self._window   = window
         self._fs       = fs
         self._callback = callback
 
@@ -329,7 +240,7 @@ class WelchRunnable(QtCore.QRunnable):
         results: list[np.ndarray] = []
         for ch in range(CHANNEL_COUNT):
             _, psd = scipy_welch(
-                self._snap[:, ch],
+                self._window.samples[:, ch],
                 fs=self._fs,
                 window='hann',
                 nperseg=SPEC_N,
@@ -342,7 +253,9 @@ class WelchRunnable(QtCore.QRunnable):
             self._callback.__self__,
             self._callback.__func__.__name__,
             QtCore.Qt.ConnectionType.QueuedConnection,
-            QtCore.Q_ARG(object, results),
+            # The window travels with its PSD, so the receiver can check it
+            # is still valid for a control update when the result arrives.
+            QtCore.Q_ARG(object, (results, self._window)),
         )
 
 
@@ -357,11 +270,13 @@ class AudioOutputWorker(QtCore.QThread):
     unit RMS before output_gain is applied, so output_gain alone controls the
     DAC level independent of the profile shape or absolute Grms.
 
-    Clip detection fires clip_detected if any sample exceeds ±1.0 after
-    output_gain scaling.
+    Clip detection fires clip_detected for EVERY block in which a sample
+    exceeds ±1.0 after output_gain scaling, so the indicator stays lit for as
+    long as the clipping lasts.
     """
 
     clip_detected = QtCore.pyqtSignal()
+    failed        = QtCore.pyqtSignal(str)   # output stream could not be opened / died
 
     def __init__(self) -> None:
         super().__init__()
@@ -403,32 +318,34 @@ class AudioOutputWorker(QtCore.QThread):
             self._corr_freqs = None
             self._corr_db    = None
 
+    def render(self, frames: int, rng: np.random.Generator) -> tuple[np.ndarray, bool]:
+        """One output block at the current settings, and whether it clipped."""
+        with self._lock:
+            bp      = self._breakpoints
+            gain    = self._gain_db
+            og      = self._output_gain
+            corr_f  = self._corr_freqs
+            corr_db = self._corr_db
+
+        sig = _generate_shaped_block(bp, gain, frames, self._fs, rng, corr_f, corr_db)
+        sig *= og
+
+        clipped = bool(np.max(np.abs(sig)) > 1.0)
+        if clipped:
+            np.clip(sig, -1.0, 1.0, out=sig)
+        return sig, clipped
+
     def run(self) -> None:
         if not HAS_SOUNDDEVICE:
+            self.failed.emit('sounddevice is not installed')
             return
 
         rng = np.random.default_rng()   # per-thread RNG, never shared
-        clipped_last = False
 
         def callback(outdata: np.ndarray, frames: int, _time, _status) -> None:
-            nonlocal clipped_last
-            with self._lock:
-                bp      = self._breakpoints
-                gain    = self._gain_db
-                og      = self._output_gain
-                corr_f  = self._corr_freqs
-                corr_db = self._corr_db
-
-            sig = _generate_shaped_block(bp, gain, frames, self._fs, rng, corr_f, corr_db)
-            sig *= og
-
-            if np.max(np.abs(sig)) > 1.0:
-                np.clip(sig, -1.0, 1.0, out=sig)
-                if not clipped_last:
-                    clipped_last = True
-                    self.clip_detected.emit()
-            else:
-                clipped_last = False
+            sig, clipped = self.render(frames, rng)
+            if clipped:
+                self.clip_detected.emit()
 
             outdata[:, 0] = sig
             if outdata.shape[1] > 1:
@@ -450,7 +367,8 @@ class AudioOutputWorker(QtCore.QThread):
                 while self._running:
                     self.msleep(50)
         except Exception as exc:
-            print(f'Audio output error: {exc}')
+            if self._running:           # not a failure if we were asked to stop
+                self.failed.emit(str(exc))
 
     def stop(self) -> None:
         self._running = False
@@ -467,6 +385,11 @@ def _generate_shaped_block(
     corr_db: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """IFFT spectral-shaping: white noise coloured to match the PSD profile.
+
+    Returns a UNIT-RMS block. Only the profile's shape survives: gain_db scales
+    every bin alike and is divided straight back out by the normalisation, so
+    it cannot change the level. Sequence gain steps reach the DAC through the
+    output gain (SpectralController.output_dbfs), never through here.
 
     corr_freqs / corr_db: optional per-bin correction from the control loop
     (dB power, same sign convention as error: positive = drive more).
@@ -547,10 +470,14 @@ class BreakpointModel(QtCore.QAbstractTableModel):
             v = float(value)
         except (ValueError, TypeError):
             return False
-        if v <= 0:
+        rows = [list(r) for r in self._rows]
+        rows[index.row()][index.column()] = v
+        rows.sort(key=lambda r: r[0])
+        # Reject the edit outright rather than hold a table the PSD maths
+        # cannot use — a duplicate frequency is a zero-width segment.
+        if breakpoint_error([(r[0], r[1]) for r in rows]) is not None:
             return False
-        self._rows[index.row()][index.column()] = v
-        self._rows.sort(key=lambda r: r[0])
+        self._rows = rows
         self.layoutChanged.emit()
         return True
 
@@ -654,26 +581,33 @@ class SequenceModel(QtCore.QAbstractTableModel):
 # ── Test Profile Dock ─────────────────────────────────────────────────────────
 
 class TestProfileDock(QtWidgets.QDockWidget):
-    profile_changed = QtCore.pyqtSignal()
-    step_started    = QtCore.pyqtSignal(int, float)   # step_idx, gain_db
-    test_started    = QtCore.pyqtSignal()              # fired once on Start
-    test_stopped    = QtCore.pyqtSignal()
+    profile_changed  = QtCore.pyqtSignal()             # breakpoint table edited
+    sequence_changed = QtCore.pyqtSignal()             # sequence table edited
+    step_started     = QtCore.pyqtSignal(int, float)   # step_idx, gain_db
+    test_started     = QtCore.pyqtSignal()              # fired once on Start
+    test_stopped     = QtCore.pyqtSignal()
+    reset_requested  = QtCore.pyqtSignal()             # ↺ Reset pressed
     save_response_requested = QtCore.pyqtSignal()
     load_response_requested = QtCore.pyqtSignal()
     audio_started           = QtCore.pyqtSignal()
+    audio_stopped           = QtCore.pyqtSignal()
+    audio_failed            = QtCore.pyqtSignal(str)
+    # The drive changed in a way the loop did not command: the slider, a
+    # sequence step, Drive On. Data measured before it must not be controlled on.
+    drive_changed           = QtCore.pyqtSignal()
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, controller: SpectralController, parent=None) -> None:
         super().__init__('Test Profile', parent)
         self.setFeatures(
             QtWidgets.QDockWidget.DockWidgetMovable |
             QtWidgets.QDockWidget.DockWidgetFloatable
         )
+        # The controller owns the drive level; this dock only seeds it from the
+        # slider and relays it to the audio worker.
+        self._ctl       = controller
         self._bp_model  = BreakpointModel()
         self._seq_model = SequenceModel()
-        self._running   = False
-        self._paused    = False
-        self._step_idx  = 0
-        self._elapsed_s = 0.0
+        self._runner    = SequenceRunner(self._seq_model.steps())
         self._audio_worker: Optional[AudioOutputWorker] = None
 
         self._timer = QtCore.QTimer(self)
@@ -683,8 +617,8 @@ class TestProfileDock(QtWidgets.QDockWidget):
         self._build_ui()
         self._bp_model.layoutChanged.connect(self._on_profile_changed)
         self._bp_model.dataChanged.connect(self._on_profile_changed)
-        self._seq_model.layoutChanged.connect(self._update_total_label)
-        self._seq_model.dataChanged.connect(self._update_total_label)
+        self._seq_model.layoutChanged.connect(self._on_sequence_changed)
+        self._seq_model.dataChanged.connect(self._on_sequence_changed)
 
     def _build_ui(self) -> None:
         w = QtWidgets.QWidget()
@@ -857,8 +791,13 @@ class TestProfileDock(QtWidgets.QDockWidget):
             'font-family: Consolas; font-weight: bold; color: #aaa; '
             'border: 1px solid #555; padding: 3px;')
         self._spec_status_lbl.setToolTip(
-            f'Share of in-band bins outside ±{TOL_ALARM_DB:.0f} dB (alarm) and '
-            f'±{TOL_ABORT_DB:.0f} dB (abort) of the demand profile.'
+            f'Share of in-band bins inside ±{TOL_ALARM_DB:.0f} dB (alarm) and '
+            f'±{TOL_ABORT_DB:.0f} dB (abort) of the demand profile,\n'
+            f'judged on a running average of {CTRL_WINDOW_S:.0f} s control windows. '
+            'A single window scatters\n'
+            'by ~3 dB per bin on its own, so no verdict is given until the '
+            'average is full.\n'
+            'The number of windows is set on the Settings tab.'
         )
         cl_lay.addWidget(self._spec_status_lbl)
 
@@ -934,16 +873,19 @@ class TestProfileDock(QtWidgets.QDockWidget):
         self._audio_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
         self._audio_slider.setTickInterval(10)
         self._audio_slider.setToolTip(
-            'Starting drive level. With the loop enabled this is a starting\n'
+            'Starting drive level for the 0 dB profile. A sequence step adds\n'
+            'its own gain on top. With the loop enabled this is a starting\n'
             'point, not a fixed setting — the level servo trims from here to\n'
-            'match the measured Grms to demand. The live value is shown to the\n'
-            'right; move the slider at any time to re-seed it.'
+            'match the measured Grms to demand. The value to the right is the\n'
+            'level actually going to the DAC. Moving the slider re-seeds the\n'
+            'servo, as do Drive On and Reset.'
         )
         self._audio_slider.valueChanged.connect(self._on_audio_level_changed)
-        self._level_db: float = float(self._audio_slider.value())
-        self._audio_level_lbl = QtWidgets.QLabel('-20 dB')
+        self._ctl.reseed_level(float(self._audio_slider.value()))
+        self._audio_level_lbl = QtWidgets.QLabel()
         self._audio_level_lbl.setStyleSheet('font-family: Consolas; color: #aaa;')
         self._audio_level_lbl.setFixedWidth(55)
+        self._apply_level()
         level_row.addWidget(self._audio_slider, stretch=1)
         level_row.addWidget(self._audio_level_lbl)
         audio_lay.addLayout(level_row)
@@ -1012,6 +954,16 @@ class TestProfileDock(QtWidgets.QDockWidget):
         m, s = divmod(int(t), 60)
         self._total_lbl.setText(f'Total: {m}m {s:02d}s')
 
+    def _on_sequence_changed(self) -> None:
+        self._update_total_label()
+        if self._runner.set_steps(self._seq_model.steps()):
+            self._complete_test()     # the step being run was deleted
+        elif self._runner.in_progress:
+            self._apply_level()       # the current step's gain may have changed
+            self._update_step_display()
+            self.drive_changed.emit()
+        self.sequence_changed.emit()
+
     # ── Channel helpers ───────────────────────────────────────────────────────
 
     def control_channels(self) -> list[str]:
@@ -1020,101 +972,89 @@ class TestProfileDock(QtWidgets.QDockWidget):
     # ── Test runner ───────────────────────────────────────────────────────────
 
     def _start_test(self) -> None:
-        if not self._seq_model.steps():
+        if not self._runner.start():
             return
-        self._running   = True
-        self._paused    = False
-        self._step_idx  = 0
-        self._elapsed_s = 0.0
         self._start_btn.setEnabled(False)
         self._pause_btn.setEnabled(True)
         self._stop_btn.setEnabled(True)
         self.test_started.emit()                     # → MainWindow resets correction
-        self._go_to_step(0)                          # sets step_idx before audio starts
+        self._enter_step()
         if HAS_SOUNDDEVICE and self._audio_worker is None:
             self._on_audio_start()                   # auto-start drive at step-0 gain
-        else:
-            self._push_audio_profile()               # already running — update gain now
         self._timer.start()
 
     def _pause_test(self) -> None:
-        if not self._running:
+        """Hold: the drive keeps its current level and shape, the loop freezes."""
+        if not self._runner.in_progress:
             return
-        self._paused = not self._paused
-        if self._paused:
-            self._timer.stop()
-            self._pause_btn.setText('▶  Resume')
-            self._step_lbl.setStyleSheet('color: #fa0; font-family: Consolas;')
-        else:
+        if self._runner.is_paused:
+            self._runner.resume()
             self._timer.start()
             self._pause_btn.setText('⏸  Pause')
             self._step_lbl.setStyleSheet('color: #4f4; font-family: Consolas;')
+        else:
+            self._runner.pause()
+            self._timer.stop()
+            self._pause_btn.setText('▶  Resume')
+            self._step_lbl.setStyleSheet('color: #fa0; font-family: Consolas;')
 
     def _stop_test(self) -> None:
+        self._end_test('Stopped', '#888', 0)
+
+    def _complete_test(self) -> None:
+        self._end_test('Complete ✓', '#4f4', 100)
+
+    def _end_test(self, text: str, colour: str, progress: int) -> None:
+        # Stop and completion both stop the drive. Outside a test the demand
+        # is the 0 dB profile, so leaving the drive (and the loop) running
+        # would raise the level the moment the test ended.
         self._timer.stop()
-        self._running = False
-        self._paused  = False
+        self._runner.stop()
         self._start_btn.setEnabled(True)
         self._pause_btn.setEnabled(False)
         self._pause_btn.setText('⏸  Pause')
         self._stop_btn.setEnabled(False)
-        self._step_lbl.setText('Stopped')
-        self._step_lbl.setStyleSheet('color: #888; font-family: Consolas;')
-        self._progress.setValue(0)
+        self._step_lbl.setText(text)
+        self._step_lbl.setStyleSheet(f'color: {colour}; font-family: Consolas;')
+        self._progress.setValue(progress)
+        self._on_audio_stop()
         self.test_stopped.emit()
 
-    def _go_to_step(self, idx: int) -> None:
-        steps = self._seq_model.steps()
-        if idx >= len(steps):
-            self._complete_test()
-            return
-        self._step_idx  = idx
-        self._elapsed_s = 0.0
-        _, gain = steps[idx]
-        self.step_started.emit(idx, gain)
+    def _enter_step(self) -> None:
+        self.step_started.emit(self._runner.step_index, self._runner.gain_db)
         self._push_audio_profile()
+        self._apply_level()          # the step's gain is a level change at the DAC
         self._update_step_display()
+        self.drive_changed.emit()
 
     def _tick(self) -> None:
-        steps = self._seq_model.steps()
-        if self._step_idx >= len(steps):
-            return
-        self._elapsed_s += 1.0
-        dur, _ = steps[self._step_idx]
-        if self._elapsed_s >= dur:
-            self._go_to_step(self._step_idx + 1)
+        changed = self._runner.tick(1.0)
+        if self._runner.state == SequenceRunner.COMPLETE:
+            self._complete_test()
+        elif changed:
+            self._enter_step()
         else:
             self._update_step_display()
 
     def _update_step_display(self) -> None:
-        steps = self._seq_model.steps()
-        if self._step_idx >= len(steps):
+        steps = self._runner.steps
+        idx   = self._runner.step_index
+        if not self._runner.in_progress or idx >= len(steps):
             return
-        dur, gain = steps[self._step_idx]
-        remaining = int(dur - self._elapsed_s)
+        dur, gain = steps[idx]
+        remaining = max(0, int(dur - self._runner.step_elapsed_s))
         m, s = divmod(remaining, 60)
         target_g = psd_grms(self._bp_model.breakpoints(), gain)
         self._step_lbl.setText(
-            f'Step {self._step_idx+1}/{len(steps)}  ·  {gain:+.1f} dB  ·  '
+            f'Step {idx+1}/{len(steps)}  ·  {gain:+.1f} dB  ·  '
             f'{target_g:.3f} g  ·  {m}:{s:02d} left'
         )
-        if not self._paused:
+        if not self._runner.is_paused:
             self._step_lbl.setStyleSheet('color: #4f4; font-family: Consolas;')
-        self._progress.setValue(int(100 * self._elapsed_s / dur))
+        self._progress.setValue(
+            min(100, int(100 * self._runner.step_elapsed_s / dur)))
         self._grms_target_lbl.setText(f'Target: {target_g:.3f} g')
         self._grms_target_lbl.setStyleSheet('color: #fff; font-family: Consolas;')
-
-    def _complete_test(self) -> None:
-        self._timer.stop()
-        self._running = False
-        self._start_btn.setEnabled(True)
-        self._pause_btn.setEnabled(False)
-        self._stop_btn.setEnabled(False)
-        self._step_lbl.setText('Complete ✓')
-        self._step_lbl.setStyleSheet('color: #4f4; font-family: Consolas;')
-        self._progress.setValue(100)
-        self._push_audio_profile()   # reverts to 0 dB on the audio thread
-        self.test_stopped.emit()
 
     # ── Audio helpers ─────────────────────────────────────────────────────────
 
@@ -1132,42 +1072,45 @@ class TestProfileDock(QtWidgets.QDockWidget):
 
     def _on_audio_level_changed(self, db_val: int) -> None:
         # Moving the slider re-seeds the servo rather than fighting it.
-        self._level_db = float(db_val)
+        self._ctl.reseed_level(float(db_val))
         self._apply_level()
+        self.drive_changed.emit()
 
     def _apply_level(self) -> None:
-        self._level_db = max(LEVEL_MIN_DB, min(0.0, self._level_db))
-        self._audio_level_lbl.setText(f'{self._level_db:+.1f} dB')
+        """Show the level going to the DAC and hand it to the audio worker.
+
+        Call after anything that moves it: the slider, the level servo, or a
+        sequence step — whose gain is applied here, as output level, because
+        the synthesised block is unit-RMS whatever gain the profile carries.
+        Every caller except the servo must also emit drive_changed.
+        """
+        out_db = self._ctl.output_dbfs(self.current_gain_db())
+        self._audio_level_lbl.setText(f'{out_db:+.1f} dB')
         if self._audio_worker is not None:
-            self._audio_worker.set_output_gain(10.0 ** (self._level_db / 20.0))
+            self._audio_worker.set_output_gain(10.0 ** (out_db / 20.0))
 
     @property
-    def level_db(self) -> float:
-        return self._level_db
-
-    def nudge_level_db(self, delta_db: float) -> None:
-        """Level servo. The per-bin correction cannot change overall level —
-        unit-RMS normalisation divides any common-mode part straight out — so
-        this is the only path that can."""
-        if abs(delta_db) < 1e-3:
-            return
-        self._level_db += delta_db
-        self._apply_level()
+    def drive_running(self) -> bool:
+        return self._audio_worker is not None
 
     def _on_audio_start(self) -> None:
         if self._audio_worker is not None:
             return
+        # Always start from the operator's level, never from wherever the
+        # servo was left by an earlier run.
+        self._ctl.reseed_level(float(self._audio_slider.value()))
         w = AudioOutputWorker()
         w.set_profile(self._bp_model.breakpoints(), self.current_gain_db())
-        w.set_output_gain(10.0 ** (self._level_db / 20.0))
         dev_idx = self._audio_dev_combo.currentData()
         if dev_idx is not None:
             w.set_device(int(dev_idx))
         fs_text = self._audio_rate_combo.currentText()
         w.set_fs(int(fs_text))
         w.clip_detected.connect(self._on_clip_detected)
-        w.start()
+        w.failed.connect(self._on_audio_failed)
         self._audio_worker = w
+        self._apply_level()
+        w.start()
         self._audio_start_btn.setEnabled(False)
         self._audio_stop_btn.setEnabled(True)
         self._audio_clip_lbl.setText('')
@@ -1175,6 +1118,7 @@ class TestProfileDock(QtWidgets.QDockWidget):
         # otherwise a saved response is ignored until the next Welch cycle,
         # and never applied at all when the loop is disabled.
         self.audio_started.emit()
+        self.drive_changed.emit()
 
     def _on_audio_stop(self) -> None:
         if self._audio_worker is None:
@@ -1184,8 +1128,21 @@ class TestProfileDock(QtWidgets.QDockWidget):
         self._audio_start_btn.setEnabled(True)
         self._audio_stop_btn.setEnabled(False)
         self._audio_clip_lbl.setText('')
+        self.audio_stopped.emit()
+
+    def _on_audio_failed(self, message: str) -> None:
+        if self.sender() is not self._audio_worker:
+            return                    # a worker we have already let go of
+        # The stream is dead: say so, and do not leave a test running against
+        # a drive that is not there.
+        self._on_audio_stop()
+        if self._runner.in_progress:
+            self._stop_test()
+        self.audio_failed.emit(message)
 
     def _on_clip_detected(self) -> None:
+        # Fires for every clipping block, and each one restarts the timer, so
+        # the label stays up for as long as the clipping does.
         self._audio_clip_lbl.setText('CLIP')
         self._clip_clear_timer.start()
 
@@ -1228,31 +1185,35 @@ class TestProfileDock(QtWidgets.QDockWidget):
             colour = '#f44'   # clamp is binding — flag it regardless of error
         self._ctrl_err_lbl.setStyleSheet(f'font-family: Consolas; color: {colour};')
 
-    def update_spec_status(self, alarm_frac: float, abort_frac: float) -> None:
-        """In-spec readout: share of controlled bins outside each tolerance."""
-        if abort_frac > 0.02:
-            txt, colour = 'ABORT', '#f44'
-        elif alarm_frac > 0.05:
-            txt, colour = 'ALARM', '#fa0'
+    def update_loop_idle(self, reason: str) -> None:
+        self._ctrl_err_lbl.setText(f'Error RMS: —  ({reason})')
+        self._ctrl_err_lbl.setStyleSheet('font-family: Consolas; color: #aaa;')
+
+    def update_spec_status(self, status: Optional[SpecStatus]) -> None:
+        """In-spec readout: share of controlled bins inside each tolerance."""
+        if status is None:
+            txt, colour = '—', '#aaa'
         else:
-            txt, colour = 'IN SPEC', '#4f4'
-        self._spec_status_lbl.setText(
-            f'{txt}   ±{TOL_ALARM_DB:.0f}dB {(1-alarm_frac)*100:.0f}%   '
-            f'±{TOL_ABORT_DB:.0f}dB {(1-abort_frac)*100:.0f}%')
+            verdict = status.verdict
+            colour = {'ABORT': '#f44', 'ALARM': '#fa0',
+                      'IN SPEC': '#4f4'}.get(verdict, '#aaa')
+            if not status.settled:
+                # Too few averages for a verdict — the scatter alone would fail it.
+                verdict += f' {status.n_windows}/{status.n_avg}'
+            txt = (f'{verdict}   ±{TOL_ALARM_DB:.0f}dB {(1-status.alarm_frac)*100:.0f}%   '
+                   f'±{TOL_ABORT_DB:.0f}dB {(1-status.abort_frac)*100:.0f}%')
+        self._spec_status_lbl.setText(txt)
+        border = colour if colour != '#aaa' else '#555'
         self._spec_status_lbl.setStyleSheet(
             f'font-family: Consolas; font-weight: bold; color: {colour}; '
-            f'border: 1px solid {colour}; padding: 3px;')
+            f'border: 1px solid {border}; padding: 3px;')
 
     def _on_ctrl_reset(self) -> None:
-        self.clear_correction()
-        self._spec_status_lbl.setText('—')
-        self._spec_status_lbl.setStyleSheet(
-            'font-family: Consolas; font-weight: bold; color: #aaa; '
-            'border: 1px solid #555; padding: 3px;')
-        self._ctrl_err_lbl.setText('Error RMS: —')
-        self._ctrl_err_lbl.setStyleSheet('font-family: Consolas; color: #aaa;')
-        # Signal MainWindow to zero its correction array too
-        self.profile_changed.emit()
+        # Reset means "start over from what the operator set": the saved
+        # response for shape, the slider for level.
+        self._ctl.reseed_level(float(self._audio_slider.value()))
+        self.reset_requested.emit()   # MainWindow resets the correction
+        self._apply_level()
 
     def _push_audio_profile(self) -> None:
         if self._audio_worker is not None:
@@ -1261,37 +1222,23 @@ class TestProfileDock(QtWidgets.QDockWidget):
             )
 
     def current_gain_db(self) -> float:
-        if not self._running:
-            return 0.0
-        steps = self._seq_model.steps()
-        return steps[self._step_idx][1] if self._step_idx < len(steps) else 0.0
+        return self._runner.gain_db
 
     @property
     def is_running(self) -> bool:
-        return self._running
+        return self._runner.in_progress
+
+    @property
+    def is_paused(self) -> bool:
+        return self._runner.is_paused
 
     def test_elapsed_s(self) -> float:
-        """Elapsed across the whole sequence — _elapsed_s alone is per-step."""
-        steps = self._seq_model.steps()
-        done  = sum(d for d, _ in steps[:self._step_idx])
-        return float(done + self._elapsed_s)
+        """Elapsed across the whole sequence — not the per-step clock."""
+        return self._runner.elapsed_s
 
     def demand_grms_trace(self) -> tuple[np.ndarray, np.ndarray]:
-        """Target Grms staircase for the entire sequence, computed up front.
-
-        Each step's Grms is the analytic integral of the profile at that step's
-        gain, so the whole demand history is known before the test starts.
-        """
-        bp = self._bp_model.breakpoints()
-        ts: list[float] = []
-        gs: list[float] = []
-        t = 0.0
-        for dur, gain in self._seq_model.steps():
-            g = psd_grms(bp, gain)
-            ts.extend((t, t + dur))    # flat within the step, vertical at the edge
-            gs.extend((g, g))
-            t += dur
-        return np.asarray(ts, dtype=np.float64), np.asarray(gs, dtype=np.float64)
+        """Target Grms staircase for the entire sequence, computed up front."""
+        return self._runner.plan(self._bp_model.breakpoints())
 
     def update_measured_grms(self, grms: float) -> None:
         self._grms_meas_lbl.setText(f'Meas: {grms:.3f} g')
@@ -1304,8 +1251,6 @@ class TestProfileDock(QtWidgets.QDockWidget):
 
 class MainWindow(QtWidgets.QMainWindow):
 
-    _fft_done = QtCore.pyqtSignal(object)
-
     def __init__(self, demo: bool = False) -> None:
         super().__init__()
         self.demo   = demo
@@ -1314,33 +1259,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sensitivity  = FSR_OPTIONS[FSR_DEFAULT]
         self._total_drops  = 0
 
-        self._ring:      np.ndarray = np.zeros((HISTORY, CHANNEL_COUNT), dtype=np.float32)
-        self._ring_filt: np.ndarray = np.zeros((HISTORY, CHANNEL_COUNT), dtype=np.float32)
-        self._disp:      np.ndarray = np.zeros((HISTORY, CHANNEL_COUNT), dtype=np.float32)
-        self._ring_ptr:    int        = 0
-        self._n_samples:   int        = 0
+        # Ring buffers, bandpass state and both Welch gates.
+        self._stream = MeasurementStream(CHANNEL_COUNT)
         self._plot_samples: int       = int(2.0 * SAMPLE_RATE)  # initial display: 2 s
         self._t_axis:      np.ndarray = np.linspace(-WINDOW_TIME, 0.0, HISTORY, dtype=np.float32)
 
-        self._fs_meas:    float       = SAMPLE_RATE
-        self._fs_history: list[float] = []
+        freqs                = np.fft.rfftfreq(SPEC_N, 1.0 / SAMPLE_RATE)
+        self._plot_mask      = (freqs >= PSD_FMIN) & (freqs <= PSD_FMAX)
+        self._plot_freqs     = freqs[self._plot_mask]
+        self._log_plot_freqs = np.log10(self._plot_freqs)
 
-        self._sos, self._zi = self._build_filter(SAMPLE_RATE)
-        self._update_freq_arrays(SAMPLE_RATE)
-        # Control loop correction spectrum (dB power, 0 = no correction).
-        # Shape matches _plot_freqs. _H_base_db is the saved rig response that
-        # Reset falls back to; _H_corr_db is what is actually applied.
+        # Level servo, shape loop and the saved speaker response. The correction
+        # spectrum it holds is dB power on _plot_freqs, 0 = no correction.
+        self._ctl      = SpectralController(self._plot_freqs)
+        # Running average behind the IN SPEC / ALARM / ABORT readout.
+        self._assessor = SpecAssessor(self._plot_freqs, SPEC_AVG_DEFAULT)
+
         self._spec_floor_log: float = PSD_FLOOR_LOG
         self._spec_base_lo:   float = PSD_FLOOR_LOG
         self._spec_hi:        float = 0.0
         self._spec_band_mask: Optional[np.ndarray] = None
-        self._H_base_db: np.ndarray = np.zeros(len(self._plot_freqs), dtype=np.float64)
-        self._H_corr_db: np.ndarray = np.zeros(len(self._plot_freqs), dtype=np.float64)
 
         self._psd:         Optional[list[np.ndarray]] = None   # EMA, display only
         self._fft_running: bool = False
-        self._last_welch_n: int = 0   # gates display Welch rate
-        self._last_ctrl_n:  int = 0   # gates control updates (fresh windows)
 
         # Grms timeline history (test time in s, measured Grms in g)
         self._grms_t: list[float] = []
@@ -1357,17 +1298,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rebuild_grms_demand()
 
         self._fs_lbl.setText(f'FS: {SAMPLE_RATE:.0f} Hz (configured)')
-        self._fft_done.connect(self._on_fft_done)
 
         # Instantiate the status bar up-front so later messages don't reflow the layout.
         self.statusBar().showMessage('Ready')
 
         # Start from the rig's previously learned response, if we have one.
         self._load_response(announce=False)
-        if np.any(self._H_base_db):
-            self.statusBar().showMessage(
-                f'Speaker response loaded from {RESPONSE_FILE.name} '
-                f'(peak {np.max(np.abs(self._H_base_db)):.1f} dB)', 8000)
 
         self._display_timer = QtCore.QTimer(self)
         self._display_timer.setInterval(33)
@@ -1388,10 +1324,15 @@ class MainWindow(QtWidgets.QMainWindow):
         root.setSpacing(4)
         root.setContentsMargins(6, 6, 6, 6)
         root.addLayout(self._build_toolbar())
-        root.addWidget(self._build_plot_panel(), stretch=1)
+
+        # Two views: the live plots, and settings that are not touched mid-run.
+        self._tabs = QtWidgets.QTabWidget()
+        self._tabs.addTab(self._build_plot_panel(), 'Live')
+        self._tabs.addTab(self._build_settings_panel(), 'Settings')
+        root.addWidget(self._tabs, stretch=1)
 
         # Test profile dock — right side
-        self._profile_dock = TestProfileDock(self)
+        self._profile_dock = TestProfileDock(self._ctl, self)
         self._profile_dock.setMinimumWidth(290)
         self._profile_dock.setMaximumWidth(360)
         self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self._profile_dock)
@@ -1399,13 +1340,70 @@ class MainWindow(QtWidgets.QMainWindow):
         self._profile_dock.profile_changed.connect(self._recompute_target)
         self._profile_dock.profile_changed.connect(self._reset_correction)
         self._profile_dock.profile_changed.connect(self._rebuild_grms_demand)
+        # A sequence edit changes the plan and maybe the current gain, but not
+        # the rig — so it does not reset what the loop has learned.
+        self._profile_dock.sequence_changed.connect(self._recompute_target)
+        self._profile_dock.sequence_changed.connect(self._rebuild_grms_demand)
         self._profile_dock.step_started.connect(self._on_step_started)
         self._profile_dock.test_started.connect(self._reset_correction)
         self._profile_dock.test_started.connect(self._on_test_started)
         self._profile_dock.test_stopped.connect(self._on_test_stopped)
+        self._profile_dock.reset_requested.connect(self._reset_correction)
         self._profile_dock.save_response_requested.connect(self._save_response)
         self._profile_dock.load_response_requested.connect(self._load_response)
-        self._profile_dock.audio_started.connect(self._push_current_correction)
+        self._profile_dock.audio_started.connect(self._on_drive_started)
+        self._profile_dock.audio_stopped.connect(self._on_drive_stopped)
+        self._profile_dock.audio_failed.connect(self._on_drive_failed)
+        self._profile_dock.drive_changed.connect(self._stream.restart_control_window)
+
+    def _build_settings_panel(self) -> QtWidgets.QWidget:
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(widget)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        grp  = QtWidgets.QGroupBox('In-spec status')
+        form = QtWidgets.QFormLayout(grp)
+
+        self._spec_avg_spin = QtWidgets.QSpinBox()
+        self._spec_avg_spin.setRange(1, SPEC_AVG_MAX)
+        self._spec_avg_spin.setValue(self._assessor.n_avg)
+        self._spec_avg_spin.setSuffix(' windows')
+        self._spec_avg_spin.setFixedWidth(120)
+        self._spec_avg_lbl = QtWidgets.QLabel()
+        self._spec_avg_lbl.setStyleSheet('color: #aaa; font-family: Consolas;')
+        avg_row = QtWidgets.QHBoxLayout()
+        avg_row.addWidget(self._spec_avg_spin)
+        avg_row.addWidget(self._spec_avg_lbl)
+        avg_row.addStretch()
+        form.addRow('Averaging:', avg_row)
+
+        note = QtWidgets.QLabel(
+            f'The IN SPEC / ALARM / ABORT readout is judged on a running average '
+            f'of the last N control windows ({CTRL_WINDOW_S:.0f} s each, '
+            f'non-overlapping). One window alone scatters by about 2.9 dB per '
+            f'bin, which fails ±{TOL_ALARM_DB:.0f} dB on estimator noise however '
+            f'good the rig is.\n\n'
+            f'More windows give a steadier verdict but a slower one: the readout '
+            f'shows AVERAGING until N windows are in, and a real excursion takes '
+            f'up to N windows to show fully.\n\n'
+            f'This affects the readout only. The control loop always acts on '
+            f'each single fresh window.')
+        note.setWordWrap(True)
+        note.setStyleSheet('color: #aaa;')
+        form.addRow(note)
+
+        self._spec_avg_spin.valueChanged.connect(self._on_spec_avg_changed)
+        self._on_spec_avg_changed(self._spec_avg_spin.value())
+
+        layout.addWidget(grp)
+        layout.addStretch()
+        return widget
+
+    def _on_spec_avg_changed(self, n: int) -> None:
+        self._assessor.n_avg = n
+        self._spec_avg_lbl.setText(
+            f'= {n * CTRL_WINDOW_S:.0f} s of data   '
+            f'(per-bin scatter ≈ {2.9 / math.sqrt(n):.1f} dB)')
 
     def _build_toolbar(self) -> QtWidgets.QHBoxLayout:
         bar = QtWidgets.QHBoxLayout()
@@ -1451,7 +1449,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._plot_len_edit.setFixedWidth(55)
         self._plot_len_edit.setToolTip(
             f'Time-domain plot length in seconds (press Enter, max {WINDOW_TIME:.0f} s). '
-            'FFT always uses the full ring buffer.'
+            f'The spectrum always uses the most recent {CTRL_WINDOW_S:.0f} s.'
         )
         self._plot_len_edit.returnPressed.connect(self._on_plot_len_edit)
 
@@ -1645,31 +1643,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ── Spectral helpers ──────────────────────────────────────────────────────
 
-    @staticmethod
-    def _build_filter(fs: float):
-        hp_freq = PSD_FMIN
-        lp_freq = min(PSD_FMAX - 5.0, fs * 0.49)
-        sos      = butter(4, [hp_freq, lp_freq], btype='bandpass', fs=fs, output='sos')
-        zi_proto = sosfilt_zi(sos)
-        zi       = np.stack([zi_proto] * CHANNEL_COUNT, axis=-1)
-        return sos, zi
-
-    def _update_freq_arrays(self, fs: float) -> None:
-        freqs            = np.fft.rfftfreq(SPEC_N, 1.0 / fs)
-        mask             = (freqs >= PSD_FMIN) & (freqs <= PSD_FMAX)
-        self._plot_freqs = freqs[mask]
-        self._plot_mask  = mask
-        self._log_plot_freqs = np.log10(self._plot_freqs)
-
-    def _update_fs(self, fs: float) -> None:
-        if abs(fs - self._fs_meas) / self._fs_meas < 0.02:
-            return
-        self._fs_meas       = fs
-        self._sos, self._zi = self._build_filter(fs)
-        self._update_freq_arrays(fs)
-        self._fs_lbl.setText(f'FS: {fs:.0f} Hz (measured)')
-        self._fs_lbl.setStyleSheet('color: #4f4;')
-
     def _recompute_target(self) -> None:
         bp      = self._profile_dock.breakpoints()
         gain_db = self._profile_dock.current_gain_db()
@@ -1691,7 +1664,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._spec_plot.setYRange(self._spec_floor_log, hi, padding=0)
 
         # Tolerance bands, drawn only across the band the loop actually controls.
-        band     = (self._plot_freqs >= bp[0][0]) & (self._plot_freqs <= bp[-1][0])
+        band     = band_mask(self._plot_freqs, bp)
         self._spec_band_mask = band
         base_log = np.log10(psd_vals)[band]
         lf_band  = self._log_plot_freqs[band]
@@ -1738,26 +1711,45 @@ class MainWindow(QtWidgets.QMainWindow):
     def _reset_correction(self) -> None:
         # Fall back to the saved speaker response, not to flat — the rig's
         # transfer function doesn't change between tests.
-        self._H_corr_db = self._H_base_db.copy()
-        if np.any(self._H_corr_db):
-            self._profile_dock.push_correction(self._plot_freqs, self._H_corr_db)
-        else:
-            self._profile_dock.clear_correction()
+        self._ctl.reset()
+        self._apply_correction()
+        self._stream.restart_control_window()   # the correction just jumped
+        self._assessor.reset()
+        self._profile_dock.update_spec_status(None)
         self._profile_dock._ctrl_err_lbl.setText('Error RMS: —')
         self._profile_dock._ctrl_err_lbl.setStyleSheet('font-family: Consolas; color: #aaa;')
         self._drive_curve.setVisible(False)
 
+    def _apply_correction(self) -> None:
+        """Hand the audio worker the correction the controller currently holds."""
+        corr = self._ctl.corr_db
+        if np.any(corr):
+            self._profile_dock.push_correction(self._plot_freqs, corr)
+        else:
+            self._profile_dock.clear_correction()
+
     @QtCore.pyqtSlot()
-    def _push_current_correction(self) -> None:
-        if (self._H_corr_db.shape == self._plot_freqs.shape
-                and np.any(self._H_corr_db)):
-            self._profile_dock.push_correction(self._plot_freqs, self._H_corr_db)
+    def _on_drive_started(self) -> None:
+        # A new worker starts with no correction — give it what is already
+        # learned/loaded, or a saved response would be ignored until the next
+        # control update, and never applied at all with the loop disabled.
+        self._apply_correction()
+        self._assessor.reset()
+
+    @QtCore.pyqtSlot()
+    def _on_drive_stopped(self) -> None:
+        self._assessor.reset()
+        self._profile_dock.update_spec_status(None)
+
+    @QtCore.pyqtSlot(str)
+    def _on_drive_failed(self, message: str) -> None:
+        self.statusBar().showMessage(f'Audio output failed — drive is OFF: {message}')
 
     # ── Speaker response persistence ──────────────────────────────────────────
 
     @QtCore.pyqtSlot()
     def _save_response(self) -> None:
-        if self._H_corr_db.shape != self._plot_freqs.shape or not np.any(self._H_corr_db):
+        if not np.any(self._ctl.corr_db):
             QtWidgets.QMessageBox.information(
                 self, 'Save speaker response',
                 'No correction to save yet — run the loop until the error '
@@ -1765,22 +1757,14 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
         try:
-            RESPONSE_FILE.write_text(json.dumps({
-                'note':     'Learned inverse response of the drive chain '
-                            '(amp + speaker/shaker + fixture). dB power.',
-                'fs_hz':    SAMPLE_RATE,
-                'spec_n':   SPEC_N,
-                'freqs_hz': [round(float(f), 3) for f in self._plot_freqs],
-                'corr_db':  [round(float(c), 3) for c in self._H_corr_db],
-            }, indent=1), encoding='utf-8')
+            self._ctl.save_response(RESPONSE_FILE)
         except OSError as exc:
             QtWidgets.QMessageBox.warning(
                 self, 'Save speaker response', f'Could not write file:\n{exc}')
             return
-        self._H_base_db = self._H_corr_db.copy()
         self.statusBar().showMessage(
             f'Speaker response saved to {RESPONSE_FILE.name} '
-            f'(peak {np.max(np.abs(self._H_base_db)):.1f} dB)', 5000)
+            f'(peak {np.max(np.abs(self._ctl.base_db)):.1f} dB)', 5000)
 
     @QtCore.pyqtSlot()
     def _load_response(self, announce: bool = True) -> None:
@@ -1790,29 +1774,25 @@ class MainWindow(QtWidgets.QMainWindow):
                     self, 'Load speaker response',
                     f'No saved response found at:\n{RESPONSE_FILE}')
             return
+        # The file is checked against the clamp the loop is running with now.
+        self._ctl.max_boost_db = self._profile_dock.max_correction_db
         try:
-            data = json.loads(RESPONSE_FILE.read_text(encoding='utf-8'))
-            f_saved = np.asarray(data['freqs_hz'], dtype=np.float64)
-            c_saved = np.asarray(data['corr_db'],  dtype=np.float64)
-        except (OSError, ValueError, KeyError) as exc:
+            self._ctl.load_response(RESPONSE_FILE)
+        except ResponseError as exc:
             if announce:
                 QtWidgets.QMessageBox.warning(
-                    self, 'Load speaker response', f'Could not read file:\n{exc}')
+                    self, 'Load speaker response',
+                    f'{RESPONSE_FILE.name} was not loaded.\n\n{exc}')
+            else:
+                # Startup: no dialog, but leave it up until something replaces it.
+                self.statusBar().showMessage(
+                    f'{RESPONSE_FILE.name} NOT loaded — {exc}')
             return
-        if len(f_saved) < 2 or len(f_saved) != len(c_saved):
-            return
-        # Re-grid onto the current analysis bins; taper to 0 dB outside the
-        # saved span so an old/narrower file can't inject edge-held boost.
-        self._H_base_db = np.interp(
-            np.log10(self._plot_freqs), np.log10(f_saved), c_saved,
-            left=0.0, right=0.0,
-        )
-        self._H_corr_db = self._H_base_db.copy()
-        self._profile_dock.push_correction(self._plot_freqs, self._H_corr_db)
-        if announce:
-            self.statusBar().showMessage(
-                f'Speaker response loaded from {RESPONSE_FILE.name} '
-                f'(peak {np.max(np.abs(self._H_base_db)):.1f} dB)', 5000)
+        self._apply_correction()
+        self._stream.restart_control_window()   # the correction just jumped
+        self.statusBar().showMessage(
+            f'Speaker response loaded from {RESPONSE_FILE.name} '
+            f'(peak {np.max(np.abs(self._ctl.base_db)):.1f} dB)', 8000)
 
     # ── Connection management ─────────────────────────────────────────────────
 
@@ -1825,8 +1805,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.worker and self.worker.isRunning():
             self.worker.stop()
             self.worker = None
-            self._sos, self._zi = self._build_filter(self._fs_meas)
-            self._n_samples   = 0
             self._total_drops = 0
             self._drop_lbl.setText('Drops: 0')
             self._drop_lbl.setStyleSheet('color: #aaa;')
@@ -1846,18 +1824,35 @@ class MainWindow(QtWidgets.QMainWindow):
             self._status_lbl.setStyleSheet('color: #4f4;')
 
     def _start_worker(self, worker: SerialWorker | DemoWorker) -> None:
+        # New session: clear the stream — data, filter state and BOTH Welch
+        # gates together — and everything that was averaged from the old one.
+        self._stream.reset()
+        self._psd = None
+        self._assessor.reset()
         self.worker = worker
         self.worker.batch_ready.connect(self._on_batch)
+        if isinstance(worker, SerialWorker):
+            worker.failed.connect(self._on_serial_failed)
         self.worker.start()
         if self.demo:
             self._status_lbl.setText('●  DEMO')
             self._status_lbl.setStyleSheet('color: #fa0;')
 
+    @QtCore.pyqtSlot(str)
+    def _on_serial_failed(self, message: str) -> None:
+        worker = self.sender()
+        if worker is not self.worker or worker is None:
+            return                    # a worker we have already let go of
+        self.worker = None
+        worker.wait(2000)
+        self._connect_btn.setText('Connect')
+        self._status_lbl.setText('●  Connection failed')
+        self._status_lbl.setStyleSheet('color: #f44;')
+        self.statusBar().showMessage(f'Serial error: {message}')
+
     # ── Data pipeline ─────────────────────────────────────────────────────────
 
-    def _on_batch(self, batch: np.ndarray, t0: float, t1: float, drops: int) -> None:  # noqa: ARG002
-        n = len(batch)
-
+    def _on_batch(self, batch: np.ndarray, drops: int) -> None:
         if drops:
             self._total_drops += drops
             self._drop_lbl.setText(f'Drops: {self._total_drops}')
@@ -1865,52 +1860,33 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # FS is fixed by the firmware timer — chunked serial reads make wall-clock
         # estimation unreliable (parsing time << sample period).
+        self._stream.push(batch)
 
-        filt, self._zi = sosfilt(self._sos, batch, axis=0, zi=self._zi)
-
-        p = self._ring_ptr
-        if p + n <= HISTORY:
-            self._ring[p:p+n]      = batch
-            self._ring_filt[p:p+n] = filt
-        else:
-            first = HISTORY - p
-            self._ring[p:]      = batch[:first]; self._ring[:n-first]      = batch[first:]
-            self._ring_filt[p:] = filt[:first];  self._ring_filt[:n-first] = filt[first:]
-
-        self._ring_ptr   = (p + n) % HISTORY
-        self._n_samples += n
-
-        # Welch runs at DISPLAY_WELCH_HZ so the spectrum stays live. The control
-        # update is gated separately in _on_fft_done on CTRL_SAMPLES of new data.
-        if (self._n_samples >= WELCH_MIN_SAMPLES
-                and self._n_samples - self._last_welch_n >= DISPLAY_WELCH_SAMPLES
-                and not self._fft_running):
-            self._last_welch_n = self._n_samples
-            self._launch_welch()
-
-    def _launch_welch(self) -> None:
-        self._fft_running = True
-        n = min(CTRL_SAMPLES, self._n_samples, HISTORY)
-        # Most recent n samples, ending at the write pointer.
-        start = (self._ring_ptr - n) % HISTORY
-        if start + n <= HISTORY:
-            snap = self._ring_filt[start:start + n].astype(np.float64)
-        else:
-            first = HISTORY - start
-            snap = np.empty((n, CHANNEL_COUNT), dtype=np.float64)
-            snap[:first] = self._ring_filt[start:]
-            snap[first:] = self._ring_filt[:n - first]
-        runnable = WelchRunnable(snap, self._fs_meas, self._on_fft_done)
-        self._pool.start(runnable)
+        # Welch runs at DISPLAY_WELCH_HZ so the spectrum stays live. Whether a
+        # window may also drive a control update is decided by the stream: only
+        # on CTRL_SAMPLES of new data, all of it gathered since the drive last
+        # changed.
+        if not self._fft_running:
+            window = self._stream.take_window()
+            if window is not None:
+                self._fft_running = True
+                self._pool.start(
+                    WelchRunnable(window, SAMPLE_RATE, self._on_welch_done))
 
     @QtCore.pyqtSlot(object)
-    def _on_fft_done(self, results: list[np.ndarray]) -> None:
+    def _on_welch_done(self, payload: tuple) -> None:
+        results, window = payload
         self._fft_running = False
+        if not self._stream.is_current(window):
+            return      # computed from a session that has since been reset
+        self._on_fft_done(results, self._stream.is_control_window(window))
 
-        # `results` is the raw, fresh, non-overlapping window — the ONLY thing
-        # the control loop may use. The displayed PSD is an EMA of it purely to
-        # look as smooth as the old long-window average; feeding that back into
-        # the loop would reintroduce exactly the lag that caused the limit cycle.
+    def _on_fft_done(self, results: list[np.ndarray], is_control: bool = True) -> None:
+        # `results` is the raw, fresh window — the ONLY thing the control loop
+        # may use, and only when is_control says it shares no samples with the
+        # last one. The displayed PSD is an EMA of it purely to look smooth;
+        # feeding that back into the loop would reintroduce exactly the lag
+        # that caused the limit cycle.
         if self._psd is None or self._psd[0].shape != results[0].shape:
             self._psd = [r.copy() for r in results]
         else:
@@ -1918,167 +1894,82 @@ class MainWindow(QtWidgets.QMainWindow):
             for i, r in enumerate(results):
                 self._psd[i] += a * (r - self._psd[i])
 
-        ctrl = self._profile_dock.control_channels()
-        mask = self._plot_mask
-        df   = SAMPLE_RATE / SPEC_N   # 1.0 Hz per bin
+        dock = self._profile_dock
+        ctrl_indices = [CHANNEL_NAMES.index(ch) for ch in dock.control_channels()
+                        if ch in CHANNEL_NAMES]
+        bp = dock.breakpoints()
+        if not ctrl_indices or len(bp) < 2:
+            return
+        gain_db = dock.current_gain_db()
 
-        # Display runs every Welch; control only on a fresh non-overlapping
-        # window, so it never reacts to data it has already acted on.
-        ctrl_due = (self._n_samples - self._last_ctrl_n) >= CTRL_SAMPLES
-        if ctrl_due:
-            self._last_ctrl_n = self._n_samples
+        # ONE estimate for everything below — the mean PSD across the control
+        # channels (mean, not RSS, for spectral shaping). The Grms readout, the
+        # in-spec status and the loop all read it, so they cannot disagree.
+        meas_psd = np.mean(
+            [results[i][self._plot_mask] for i in ctrl_indices], axis=0
+        )
 
         # ── Measured Grms display ─────────────────────────────────────────
-        if ctrl:
-            grms_sq = sum(
-                float(np.sum(results[CHANNEL_NAMES.index(ch)][mask])) * df
-                for ch in ctrl if ch in CHANNEL_NAMES
-            )
-            grms = math.sqrt(max(grms_sq, 0.0))
-            self._profile_dock.update_measured_grms(grms)
-            if self._profile_dock.is_running:
-                now = self._profile_dock.test_elapsed_s()
-                self._grms_now_line.setPos(now)
-                self._grms_now_line.setVisible(True)
-                if ctrl_due:
-                    # One point per independent window — a trend, not a smear.
-                    self._grms_t.append(now)
-                    self._grms_v.append(grms)
-                    self._grms_meas_curve.setData(self._grms_t, self._grms_v)
+        grms = band_grms(self._plot_freqs, meas_psd, bp)
+        dock.update_measured_grms(grms)
+        if dock.is_running:
+            now = dock.test_elapsed_s()
+            self._grms_now_line.setPos(now)
+            self._grms_now_line.setVisible(True)
+            if is_control:
+                # One point per independent window — a trend, not a smear.
+                self._grms_t.append(now)
+                self._grms_v.append(grms)
+                self._grms_meas_curve.setData(self._grms_t, self._grms_v)
 
-        # ── Spectral error, in-spec status, and closed-loop correction ────
-        if ctrl:
-            ctrl_indices = [CHANNEL_NAMES.index(ch) for ch in ctrl
-                            if ch in CHANNEL_NAMES]
+        # Everything below runs once per fresh non-overlapping window, so it
+        # never reacts to data it has already acted on.
+        if not is_control:
+            return
 
-            # Average PSD across control channels (mean, not RSS, for spectral shaping)
-            meas_psd = np.mean(
-                [results[i][mask] for i in ctrl_indices], axis=0
-            )
+        # ── In-spec status ────────────────────────────────────────────────
+        # Reports what the rig is doing, not what the controller is doing, so
+        # it is computed with the loop off too.
+        self._assessor.add(meas_psd, bp, gain_db)
+        dock.update_spec_status(self._assessor.status(bp))
 
-            bp = self._profile_dock.breakpoints()
-            if len(bp) < 2:
-                return
+        # ── Closed-loop correction ────────────────────────────────────────
+        if not dock.loop_enabled:
+            return
+        self._ctl.loop_gain    = dock.loop_gain
+        self._ctl.max_boost_db = dock.max_correction_db
+        # With no drive playing the measurement is ambient noise, and a paused
+        # test is a hold — neither may be integrated.
+        out = self._ctl.update(
+            meas_psd, bp, gain_db,
+            drive_active=dock.drive_running and not dock.is_paused,
+        )
+        if not out.acted:
+            dock.update_loop_idle('paused' if dock.is_paused else 'drive off')
+            return
 
-            demand_psd = psd_interp_loglog(
-                self._plot_freqs, bp, self._profile_dock.current_gain_db(),
-            )
+        dock._apply_level()
+        dock.push_correction(self._plot_freqs, out.corr_db)
+        dock.update_loop_error(out.err_rms_db, out.sat_frac)
 
-            # Control only inside the profile band — the drive synthesises nothing
-            # outside it, so correcting there does nothing except pin the error
-            # readout high and saturate the clamp.
-            band = ((self._plot_freqs >= bp[0][0]) &
-                    (self._plot_freqs <= bp[-1][0]))
-            if not band.any():
-                return
-
-            # dB error: positive → we're below demand → need to drive harder
-            err_db = 10.0 * np.log10(demand_psd) - 10.0 * np.log10(meas_psd)
-            err_db[~band] = 0.0
-
-            # In-spec status tracks the live display, not the control cadence —
-            # it is meaningful even with the loop switched off.
-            in_band_err = np.abs(err_db[band])
-            self._profile_dock.update_spec_status(
-                float(np.mean(in_band_err > TOL_ALARM_DB)),
-                float(np.mean(in_band_err > TOL_ABORT_DB)),
-            )
-
-            if not (self._profile_dock.loop_enabled and ctrl_due):
-                return
-
-            # Ensure correction arrays have the right size (resets can resize _plot_freqs)
-            if self._H_corr_db.shape != err_db.shape:
-                self._H_corr_db = np.zeros_like(err_db)
-            if self._H_base_db.shape != err_db.shape:
-                self._H_base_db = np.zeros_like(err_db)
-
-            # Split the error. The common-mode part is a pure level deficit; the
-            # per-bin loop is blind to it (unit-RMS normalisation cancels any
-            # uniform correction exactly), so it goes to the level servo. What
-            # remains is zero-mean and is genuinely about spectral shape — which
-            # is also the only part that survives the normalisation.
-            common = float(np.mean(err_db[band]))
-            self._profile_dock.nudge_level_db(
-                float(np.clip(common, -CTRL_LEVEL_MAX_STEP_DB,
-                              CTRL_LEVEL_MAX_STEP_DB)))
-            # err_db stays intact for the readouts — reporting the zero-mean
-            # residual would hide a pure level deficit entirely.
-            err_shape = err_db - common
-            err_shape[~band] = 0.0
-
-            # Smooth error across frequency — one noisy bin must not swing its
-            # own correction independently of its neighbours.
-            err_smooth = gaussian_filter1d(err_shape, sigma=5.0)
-
-            # Soft deadband: shrink toward zero rather than hard-gating, so the
-            # correction stops random-walking on measurement noise once
-            # converged, without chattering at the threshold.
-            err_eff = np.sign(err_smooth) * np.maximum(
-                np.abs(err_smooth) - CTRL_DEADBAND_DB, 0.0)
-
-            # Integral update. The plant is memoryless in dB
-            # (measured_dB = drive_dB + plant_dB), so error decays as
-            # (1 - gain)^n — deadbeat at gain 1, stable below 2. Valid only
-            # because each update now sees a fresh, non-overlapping window.
-            max_corr = self._profile_dock.max_correction_db
-            corr_hi  = max_corr
-            corr_lo  = -min(max_corr, CTRL_MAX_CUT_DB)
-            # Asymmetric response. Growing |correction| uses the user's gain and
-            # the tight slew limit, because that is where stability is at stake.
-            # Shrinking it is a return to neutral — the worst case is landing at
-            # zero correction, i.e. driving the raw profile — so it runs at unity
-            # gain and may unwind a full rail in a single update.
-            raw     = self._profile_dock.loop_gain * err_eff
-            toward  = (raw * self._H_corr_db) < 0.0
-            raw     = np.where(toward, err_eff, raw)
-            lim     = np.where(toward, CTRL_MAX_UNWIND_DB, CTRL_MAX_STEP_DB)
-            step    = np.clip(raw, -lim, lim)
-            # ...but never fling a bin through zero out the other side; land on it.
-            over        = toward & (np.abs(step) > np.abs(self._H_corr_db))
-            step[over]  = -self._H_corr_db[over]
-
-            # Anti-windup by conditional integration: never accumulate further
-            # into a rail we are already sitting on. Without this a bin the rig
-            # cannot reach keeps integrating, so when conditions change it has to
-            # unwind through tens of dB before the drive responds at all — which
-            # is what stalls recovery and looks like the loop being stuck.
-            at_hi = (self._H_corr_db >= corr_hi - 1e-9) & (step > 0.0)
-            at_lo = (self._H_corr_db <= corr_lo + 1e-9) & (step < 0.0)
-            step[at_hi | at_lo] = 0.0
-
-            self._H_corr_db += step
-            np.clip(self._H_corr_db, corr_lo, corr_hi, out=self._H_corr_db)
-            self._H_corr_db[~band] = 0.0
-
-            self._profile_dock.push_correction(self._plot_freqs, self._H_corr_db)
-            hc = self._H_corr_db[band]
-            self._profile_dock.update_loop_error(
-                float(np.sqrt(np.mean(err_db[band] ** 2))),
-                float(np.mean((hc >= corr_hi - 1e-6) | (hc <= corr_lo + 1e-6))),
-            )
-
-            # Correction trace on the right-hand dB axis: how hard each frequency
-            # is being pushed relative to the profile. Once converged this is the
-            # inverse of the rig's transfer function.
-            self._drive_curve.setData(self._log_plot_freqs[band],
-                                      self._H_corr_db[band])
-            self._drive_curve.setVisible(True)
-            span = max(10.0, float(np.max(np.abs(self._H_corr_db[band]))) * 1.15)
-            self._corr_vb.setYRange(-span, span, padding=0)
+        # Correction trace on the right-hand dB axis: how hard each frequency
+        # is being pushed relative to the profile. Once converged this is the
+        # inverse of the rig's transfer function.
+        band = out.band
+        self._drive_curve.setData(self._log_plot_freqs[band], out.corr_db[band])
+        self._drive_curve.setVisible(True)
+        span = max(10.0, float(np.max(np.abs(out.corr_db[band]))) * 1.15)
+        self._corr_vb.setYRange(-span, span, padding=0)
 
     # ── Display ───────────────────────────────────────────────────────────────
 
     def _refresh_display(self) -> None:
-        p = self._ring_ptr
-        self._disp[:HISTORY - p] = self._ring[p:]
-        self._disp[HISTORY - p:] = self._ring[:p]
-
-        n  = self._plot_samples
-        t  = self._t_axis[-n:]
+        n    = self._plot_samples
+        t    = self._t_axis[-n:]
+        disp = self._stream.recent_raw(n)
         for idx, name in enumerate(CHANNEL_NAMES):
             if self._curves[name].isVisible():
-                self._curves[name].setData(t, self._disp[-n:, idx])
+                self._curves[name].setData(t, disp[:, idx])
 
         if self._psd is not None:
             mask = self._plot_mask

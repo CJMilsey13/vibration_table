@@ -1,0 +1,5 @@
+__pycache__/
+.pytest_cache/
+
+# Learned on one rig, wrong for any other — never share it through the repo.
+speaker_response.json
