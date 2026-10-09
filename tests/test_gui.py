@@ -445,6 +445,62 @@ def test_serial_failure_returns_the_ui_to_disconnected(win, iv, monkeypatch):
     assert 'could not open port' in win.statusBar().currentMessage()
 
 
+# ── Ticket 14: the sensor's own sample rate ──────────────────────────────────
+
+BANNER = ('# icm42688_streamer 2026-10-08 drdy-polled odr=8107.419 '
+          'reset=11,0D,30,40,62 now=01,0D,7E,80,3F')
+
+
+def test_status_line_sets_the_stream_rate_and_says_so(win, iv, monkeypatch, rng):
+    monkeypatch.setattr(iv.SerialWorker, 'start', lambda self: None)
+    sw = iv.SerialWorker('FAKE', 115200, 2048.0)
+    win._start_worker(sw)
+    assert win._stream.input_rate == 8000.0 and 'configured' in win._fs_lbl.text()
+
+    for _ in range(8):                               # something averaged before the line arrives
+        win._on_fft_done(window(rng))
+    assert win._profile_dock._spec_status_lbl.text().startswith('IN SPEC')
+    epoch = win._stream.epoch
+
+    sw.info_ready.emit(BANNER)
+    assert win._stream.input_rate == 8107.419
+    assert win._stream.epoch == epoch + 1            # restarted on the right time base
+    assert win._psd is None and win._profile_dock._spec_status_lbl.text() == '—'
+    assert '8107.4' in win._fs_lbl.text() and 'resampled' in win._fs_lbl.text()
+    assert win._fs_lbl.toolTip() == BANNER
+
+    sw.info_ready.emit(BANNER.replace('8107.419', '8107.455'))   # the next measurement
+    assert win._stream.input_rate == 8107.455 and win._stream.epoch == epoch + 1
+
+
+def test_a_new_connection_starts_from_the_nominal_rate_again(win, iv, monkeypatch):
+    monkeypatch.setattr(iv.SerialWorker, 'start', lambda self: None)
+    sw = iv.SerialWorker('FAKE', 115200, 2048.0)
+    win._start_worker(sw)
+    sw.info_ready.emit(BANNER)
+    assert win._stream.input_rate != 8000.0
+    win._start_worker(iv.SerialWorker('FAKE', 115200, 2048.0))   # e.g. older firmware: no line
+    assert win._stream.input_rate == 8000.0 and 'configured' in win._fs_lbl.text()
+    sw.info_ready.emit(BANNER)                                   # the old worker is ignored
+    assert win._stream.input_rate == 8000.0
+
+
+def test_sensor_rate_stream_shows_a_tone_at_its_true_frequency(win, iv, monkeypatch):
+    monkeypatch.setattr(iv.SerialWorker, 'start', lambda self: None)
+    sw = iv.SerialWorker('FAKE', 115200, 2048.0)
+    win._start_worker(sw)
+    sw.info_ready.emit(BANNER)
+    pool = win._pool = RecordingPool(win)
+    t = np.arange(int(8107.419 * 3)) / 8107.419
+    x = np.repeat(np.sin(2 * np.pi * 2000.0 * t)[:, None], 3, axis=1).astype(np.float32)
+    for i in range(0, len(x) - 79, 80):
+        win._on_batch(x[i:i + 80], 0)
+    assert pool.launched                                         # a window was taken
+    y = win._stream.recent_raw(8000)[:, 2].astype(np.float64)
+    spec = np.abs(np.fft.rfft(y * np.hanning(8000)))
+    assert int(spec.argmax()) == 2000                            # 1 Hz bins: 2000 Hz, not 1973
+
+
 # ── Ticket 16 ────────────────────────────────────────────────────────────────
 
 def test_dead_code_is_gone(iv, win):

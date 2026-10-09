@@ -4,6 +4,13 @@ Measurement stream — ring buffers, bandpass state and the two Welch gates.
 Qt-free. Owns every counter that decides *when* a PSD may be computed, so a
 reconnect resets all of them together or none of them.
 
+Samples come IN at the sensor's own rate and leave at exactly SAMPLE_RATE.
+The sensor's output data rate is set by its internal oscillator — nominally
+8 kHz, measured at 8108 Hz on the development unit — and the firmware delivers
+every sensor sample exactly once, so the stream arrives at that rate. It is
+resampled here, using the rate the firmware reports, before anything else sees
+it. Everything downstream can then go on treating one sample as 1/8000 s.
+
 Two rates leave this module and they must never be re-merged:
 
   display  one window every DISPLAY_WELCH_SAMPLES of new data; consecutive
@@ -15,6 +22,7 @@ Two rates leave this module and they must never be re-merged:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -52,6 +60,92 @@ CTRL_SETTLE_SAMPLES = int(SAMPLE_RATE * CTRL_SETTLE_S)
 PSD_FMIN = 5.0
 PSD_FMAX = 4000.0
 
+# A reported sensor rate outside this range is not believed (±5 % of nominal;
+# the part's oscillator tolerance is about ±1–2 %).
+INPUT_RATE_MIN = 0.95 * SAMPLE_RATE
+INPUT_RATE_MAX = 1.05 * SAMPLE_RATE
+# The firmware re-measures the rate every few seconds and it wanders by a few
+# ppm. Changes that small are followed smoothly. A larger one means the first
+# report of a session has just arrived (or a different device has), so the
+# data gathered under the old assumption is discarded.
+INPUT_RATE_RESET_FRAC = 1e-3
+
+
+def banner_rate(line: str) -> Optional[float]:
+    """Sensor sample rate, in Hz, from the firmware's status line
+
+        # icm42688_streamer 2026-10-08 drdy-polled odr=8107.419 reset=… now=…
+
+    None if the line carries no usable rate — including odr=0.000, which the
+    firmware sends until its first measurement is in."""
+    m = re.search(r'\bodr=([0-9]+(?:\.[0-9]+)?)', line)
+    if not m:
+        return None
+    rate = float(m.group(1))
+    return rate if INPUT_RATE_MIN <= rate <= INPUT_RATE_MAX else None
+
+
+class Resampler:
+    """Streaming arbitrary-ratio resampler (windowed-sinc interpolation).
+
+    Each output sample is a weighted sum of the 2·HALF input samples around
+    its position in time. The kernel is a low-pass at 46 % of the LOWER of the
+    two rates, so the response is flat to about 3.3 kHz and nothing above the
+    output Nyquist is folded back in. Chunk boundaries are invisible: feeding
+    a signal in any chunking gives the same output samples.
+    """
+
+    HALF   = 32      # kernel half-width, input samples (≈4 ms of delay)
+    PHASES = 512     # kernel table resolution; linearly interpolated between
+    BETA   = 9.0     # Kaiser window — about 90 dB of stop-band
+
+    def __init__(self, channels: int, in_rate: float, out_rate: float) -> None:
+        self._channels = channels
+        self._out_rate = out_rate
+        self._taps     = np.arange(-self.HALF + 1, self.HALF + 1)
+        self.set_rate(in_rate)
+        self.reset()
+
+    def set_rate(self, in_rate: float) -> None:
+        """Follow a small change in input rate. Keeps the filter state."""
+        self._ratio = in_rate / self._out_rate          # input samples per output sample
+        fc    = 0.46 * min(in_rate, self._out_rate) / in_rate      # cycles per input sample
+        phase = np.arange(self.PHASES + 1) / self.PHASES
+        d     = self._taps[None, :] - phase[:, None]    # tap position minus output position
+        u     = np.clip(d / self.HALF, -1.0, 1.0)
+        table = (2.0 * fc * np.sinc(2.0 * fc * d)
+                 * np.i0(self.BETA * np.sqrt(1.0 - u * u)) / np.i0(self.BETA))
+        self._table = table / table.sum(axis=1, keepdims=True)     # exactly unity at DC
+
+    def reset(self) -> None:
+        self._buf = np.zeros((2 * self.HALF, self._channels), dtype=np.float64)
+        self._pos = float(self.HALF)                    # next output, in _buf coordinates
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        buf = np.concatenate([self._buf, np.asarray(x, dtype=np.float64)])
+        # Outputs whose kernel is fully inside the data we hold.
+        n = int(np.ceil((len(buf) - self.HALF - self._pos) / self._ratio))
+        if n <= 0:
+            self._buf = buf
+            return np.empty((0, self._channels), dtype=np.float64)
+        pos  = self._pos + self._ratio * np.arange(n)
+        base = np.floor(pos).astype(np.int64)
+        while n and base[n - 1] + self.HALF > len(buf) - 1:        # rounding at the edge
+            n -= 1
+        pos, base = pos[:n], base[:n]
+
+        f = (pos - base) * self.PHASES
+        j = np.minimum(f.astype(np.int64), self.PHASES - 1)
+        a = (f - j)[:, None]
+        w = (1.0 - a) * self._table[j] + a * self._table[j + 1]    # (n, taps)
+        y = np.einsum('nk,nkc->nc', w, buf[base[:, None] + self._taps[None, :]])
+
+        nxt   = self._pos + self._ratio * n
+        start = int(np.floor(nxt)) - self.HALF + 1
+        self._buf = buf[start:]
+        self._pos = nxt - start
+        return y
+
 
 @dataclass(frozen=True)
 class Window:
@@ -74,6 +168,9 @@ class MeasurementStream:
         self._ring_filt = np.zeros((HISTORY, channels), dtype=np.float32)
         self._disp      = np.zeros((HISTORY, channels), dtype=np.float32)
         self._epoch     = 0
+        # None while samples arrive at exactly fs — then push() is a pass-through.
+        self._input_rate = fs
+        self._resampler: Optional[Resampler] = None
         self.reset()
 
     def reset(self) -> None:
@@ -87,6 +184,37 @@ class MeasurementStream:
         self._last_ctrl_n  = 0   # gates control updates (fresh windows)
         self._ctrl_gen     = 0
         self._epoch       += 1
+        if self._resampler is not None:
+            self._resampler.reset()
+
+    @property
+    def input_rate(self) -> float:
+        """The rate samples are arriving at, as last reported."""
+        return self._input_rate
+
+    def set_input_rate(self, rate: float) -> bool:
+        """Say what rate push() is being fed at. True if that reset the stream.
+
+        A rate that is out of range is ignored. A change of more than
+        INPUT_RATE_RESET_FRAC — the first report of a session — discards what
+        has been gathered so far, because it was laid down on the wrong time
+        base; reset() is called and the caller should drop anything it
+        averaged from this stream. Smaller changes are just followed.
+        """
+        if not INPUT_RATE_MIN <= rate <= INPUT_RATE_MAX:
+            return False
+        nominal_now  = self._resampler is None
+        nominal_next = rate == self._fs
+        step = abs(rate / self._input_rate - 1.0)
+        self._input_rate = rate
+        if nominal_now != nominal_next or step > INPUT_RATE_RESET_FRAC:
+            self._resampler = None if nominal_next else Resampler(
+                self._channels, rate, self._fs)
+            self.reset()
+            return True
+        if self._resampler is not None:
+            self._resampler.set_rate(rate)
+        return False
 
     @property
     def n_samples(self) -> int:
@@ -97,6 +225,10 @@ class MeasurementStream:
         return self._epoch
 
     def push(self, batch: np.ndarray) -> None:
+        if self._resampler is not None:
+            batch = self._resampler.process(batch)
+            if not len(batch):
+                return
         n = len(batch)
         filt, self._zi = sosfilt(self._sos, batch, axis=0, zi=self._zi)
 

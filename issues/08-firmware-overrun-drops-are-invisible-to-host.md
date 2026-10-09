@@ -22,10 +22,25 @@ Changing the frame layout changes the wire protocol; update `FRAME_BYTES`, the h
 
 Stalling the host reader for 1 s produces a non-zero drop count of about 8000 minus the ring size.
 
-## Resolution (2026-10-07)
+## Resolution (2026-10-08)
 
-**Fixed in code and built. Not flashed or run on hardware.**
+**Fixed and verified on the hardware.** Firmware `2026-10-08`.
 
-`seq` is stamped at acquisition on Core 0 and carried through the ring; the ring is discarded when the host first connects. Frame layout is unchanged. Builds clean for `pimoroni_pico_plus2_rp2350`. Still to do at the rig: flash it and confirm that stalling the host produces a non-zero drop count.
+`seq` is stamped on Core 0 for every sample read and carried through the ring. Core 1 discards the ring when the host first connects. The frame layout is unchanged.
 
-Tests: Host side only: `test_serial.py::test_firmware_overrun_shows_up_as_drops`, `::test_drop_count_survives_sequence_wraparound`
+Measured on the rig (`python tools/hw_check.py`), old firmware (May 2026 build) against new:
+
+| | Old | New |
+|---|---|---|
+| First sequence number on the first connection after boot | 0 | 44835 (5.5 s of sampling had already happened) |
+| Frames received beyond what the elapsed time accounts for, first capture after boot | +4073 (the stale ring; 4115 on a second boot) | +371, inside the capture's ±400 timing tolerance |
+| 3 s host stall: drops reported | 22772 | 23092 |
+| 3 s host stall: samples lost without being numbered | −5 ± 18 | −3 ± 17 |
+| 1 s host stall: drops reported / unreported | 6772 / −3 ± 18 | 6836 / −6 ± 17 |
+
+Two things the measurements showed that the ticket did not expect:
+
+- On the old firmware a host stall did **not** hide any loss. The Pico SDK's USB write gives up after 500 ms, and the ring holds 512 ms, so the ring never quite overflowed; the samples were lost in the USB write, after they had been numbered. The stale 512 ms at first connection was real and is reproduced above.
+- The fix is still the right one: it no longer depends on that 12 ms of luck, and the sample loop now also numbers any sample the sensor produced that Core 0 was too late to read.
+
+Tests: `tests/test_serial.py::test_firmware_overrun_shows_up_as_drops`, `::test_drop_count_survives_sequence_wraparound` (host side); hardware results above.

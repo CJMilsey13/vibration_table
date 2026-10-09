@@ -5,6 +5,7 @@
 - Assume things are easily broken — verify answers.
 - Treat this development as aerospace: verify everything you do. Ideally two independent checks agree with each other before marking something correct.
 - Run `python -m pytest tests` before and after every change (needs `pytest`; ~15 s, no hardware, no sound device). `TEST_SEED=<n>` reruns the statistical tests on different noise.
+- Firmware and sensor behaviour are checked on the real hardware with `python tools/hw_check.py {info,rate,stall,noise} <port>` (read-only — it never drives the shaker). Run them with the rig still and the drive off after any firmware change.
 - The two independent checks already in the suite are the module tests against `tests/sim.py` (a PSD-domain plant) and `tests/test_closed_loop.py` (the real window, real synthesis, a time-domain rig). A control change is not verified until both agree.
 
 ---
@@ -58,6 +59,10 @@ Accel-only power modes (0x0C, 0x08) leave the PLL off; ADC output stays permanen
 | `ICM_PWR_ACCEL_LN_GYRO_LN` | `0x0F` | Both modes on — **do not change** |
 | `ICM_ACCEL_ODR_8K` | `0x03` | 8 kHz output data rate |
 | `ICM_ACCEL_FS_SEL_16G` | `0x00` | ±16 g FSR |
+| `ICM_ACCEL_AAF_DELT` / `_DELTSQR` / `_BITSHIFT` | `63` / `3968` / `3` | Accel anti-alias filter at 3979 Hz, its widest — reset default is 24 / 576 / 6 ≈ 1.2 kHz |
+| `ICM_GYRO_ACCEL_CONFIG0_VALUE` | `0x01` | Accel UI filter BW = ODR/2 (reset default `0x11` = ODR/4) |
+| `ODR_PERIOD_US` / `DRDY_QUIET_US` | `125` / `90` | Nominal sample period; SPI is left idle this long after each sample |
+| `BANNER_EVERY` | `16000` | Frames between status lines (2 s) |
 | `WRITE_BATCH` | `64` | Frames per USB write (Core 1) |
 | `RING_SIZE` | `4096` | Shared SPSC ring buffer size (8 bytes/entry, 32 kB, 512 ms) |
 | `FRAME_BYTES` | `10` | Bytes per frame |
@@ -65,8 +70,31 @@ Accel-only power modes (0x0C, 0x08) leave the PLL off; ADC output stays permanen
 ### Wire protocol (firmware → host, USB CDC)
 ```
 [0xAA][0x55] | seq uint16 LE | ax int16 LE | ay int16 LE | az int16 LE
-= 10 bytes per sample @ 8 kHz nominal
+= 10 bytes per sample, at the SENSOR's output data rate
 ```
+
+**The frame rate is not 8000 Hz.** It is the sensor's own ODR — 8 kHz nominal, set by
+the sensor's internal oscillator, and **8107.4 Hz on the development unit** (+1.34 %).
+The firmware measures it against the MCU crystal and reports it; the host resamples to
+exactly 8000 Hz (see "Sensor sample rate" below).
+
+Between frames, every 2 s (and once more 0.5 s after the first), the firmware sends one
+ASCII status line:
+
+```
+# icm42688_streamer 2026-10-08 drdy-polled odr=8107.411 reset=11,0D,30,40,62 now=01,0D,7E,80,3F
+```
+
+- `odr=` sensor sample rate in Hz, measured over 32768 samples (≈1 ppm). `0.000` for
+  the first second after boot.
+- `reset=` / `now=` the sensor's `GYRO_ACCEL_CONFIG0`, `ACCEL_CONFIG1`,
+  `ACCEL_CONFIG_STATIC2`, `STATIC3`, `STATIC4` as read after soft reset and as configured.
+- It is plain ASCII, so it holds no `0xAA` and cannot be taken for a frame. Any parser
+  that synchronises on `0xAA 0x55` skips it unchanged.
+- It is repeated, not sent once at connect: opening a COM port on Windows purges the
+  receive buffer just after raising DTR, which discards the first few ms of data.
+- A stream with no status line is firmware older than 2026-10-08: MCU-timed at exactly
+  8000 Hz, default sensor filters.
 
 `seq` counts samples **read from the IMU**, not frames sent. It is stamped on Core 0
 (`acq_seq`, in `ring_push`) and carried through the ring, so a sample dropped on
@@ -80,6 +108,14 @@ transmit time on Core 1 — as the firmware used to — makes every overrun invi
 4. Write `INTF_CONFIG1 = 0x91` (PLL clock), wait 1 ms
 5. Write `ACCEL_CONFIG0 = 0x03` (±16 g, 8 kHz) **before** enabling
 6. Write `GYRO_CONFIG0 = 0x03` (±2000 dps, 8 kHz) **before** enabling
+   - 6a. Read `GYRO_ACCEL_CONFIG0`, `ACCEL_CONFIG1` and (bank 2) `ACCEL_CONFIG_STATIC2/3/4`
+     — the reset values, kept for the status line
+   - 6b. Bank 2: write `ACCEL_CONFIG_STATIC2/3/4 = 0x7E / 0x80 / 0x3F` (AAF 3979 Hz),
+     read back, **return to bank 0**
+   - 6c. Write `GYRO_ACCEL_CONFIG0 = 0x01`, `ACCEL_CONFIG1 = 0x0D`, read back →
+     blink 4 if any of 6b/6c did not stick
+   - These were inserted here, not appended: bank-2 (static) registers may only be
+     written while accel and gyro are **off**, i.e. before step 7.
 7. Write `PWR_MGMT0 = 0x0F` (accel LN + gyro LN), wait **50 ms**
 8. Readback `PWR_MGMT0` → blink 3 if fail
 9. Poll `INT_STATUS` bit 3 (DRDY) up to 500 ms → blink 5 if timeout
@@ -90,18 +126,28 @@ transmit time on Core 1 — as the firmware used to — makes every overrun invi
 |---------|---------|
 | 2 | WHO_AM_I mismatch |
 | 3 | PWR_MGMT0 readback fail |
+| 4 | Accel filter config readback fail (AAF / UI filter) |
 | 5 | DRDY timeout |
 | 6 | All axes stuck at 0x8000 |
 | 7 | Temp valid but accel stuck at 0x8000 (PLL not running) |
 
 ### Dual-core architecture
-- **Core 0**: SPI polling at 8 kHz (`next += 125 µs`), writes raw 16-bit samples to ring buffer
+- **Core 0**: reads **exactly one sample per sensor data-ready**. It polls `UI_DRDY`
+  in `INT_STATUS` over SPI (reading it clears the flag), then burst-reads the accel
+  registers and pushes to the ring. The bus is left idle for `DRDY_QUIET_US` after each
+  sample, since the next DRDY cannot come sooner. No INT1 wire is needed or used.
+- Core 0 also measures the sensor's rate (samples ÷ MCU time) for the status line, and
+  if it is ever held up for two periods or more it advances `acq_seq` by the samples it
+  missed, so they show as drops. Measured: 0 drops in 1.46 M frames.
 - **Core 1**: reads ring buffer, packs 10-byte frames, batches 64 frames per `fwrite` to USB CDC (125 writes/s)
 - Core 1 **discards the ring when the host first connects** (`ring_rd = ring_wr`). Core 0
   samples from boot, so without this every connection began with 512 ms of stale data.
-- Sampling is **polled on the MCU timer, not DRDY-driven** — INT1 is defined but unused.
-  MCU and sensor clocks are not locked, so samples can repeat or skip at the beat rate
-  (ticket 14, not yet measured: `python tools/count_repeats.py <port>` with the rig still).
+- **Never go back to reading on an MCU timer** (`next += 125 µs`). The sensor's clock is
+  not locked to the MCU's and runs 1.34 % fast: read at 8000 Hz, 107 of its 8107 samples
+  a second were never read, and about 5 a second were read twice. Each is a one-sample
+  jump in time. On the rig it put sidebands ±107 Hz either side of an ambient line at
+  1737 Hz (2–3 dB over the floor beside a 13 dB line); with one read per DRDY they are
+  gone (0.1–0.3 dB).
 - Ring buffer is lock-free SPSC with `__dmb()` barriers
 
 ### Build
@@ -111,7 +157,19 @@ cmake --build .
 ```
 The board is `pimoroni_pico_plus2_rp2350` in SDK 2.2.0 — plain `pimoroni_pico_plus2`
 does not exist there and configure fails. The VS Code Pico extension's toolchain lives
-under `~/.pico-sdk` (cmake, ninja, arm-none-eabi-gcc).
+under `~/.pico-sdk` (cmake, ninja, arm-none-eabi-gcc, picotool).
+
+**What is actually flashed is a `-DPICO_BOARD=pico2` build**, and always has been
+(`picotool info` on the May 2026 firmware says `pico_board: pico2`; the chip is an
+RP2350B in QFN-80 with 16 MB flash, i.e. a Pico Plus 2). It works. The
+`pimoroni_pico_plus2_rp2350` build compiles but has **never been run on the hardware** —
+try it only with someone at the bench to press BOOTSEL if USB does not come up.
+
+Flashing needs no button: opening the CDC port at 1200 baud reboots into BOOTSEL, then
+`picotool load -v -x icm42688_streamer.uf2`. USB is brought up before the IMU is
+initialised, so this should still work while the firmware is halted on a blink code
+(not tested — no init fault has occurred). Keep that order: it is the only way back in
+without pressing the button.
 Outputs `icm42688_streamer.uf2` — drag-and-drop to flash.
 
 ---
@@ -121,7 +179,7 @@ Outputs `icm42688_streamer.uf2` — drag-and-drop to flash.
 ### Key constants
 | Constant | Value | Notes |
 |----------|-------|-------|
-| `SAMPLE_RATE` | 8000.0 Hz | Fixed by firmware timer — **not measured at runtime** |
+| `SAMPLE_RATE` | 8000.0 Hz | Rate of the stream **after resampling** — exact. The sensor's own rate is reported by the firmware and resampled away in `MeasurementStream` |
 | `WINDOW_TIME` | 10.0 s | Max ring-buffer / display length |
 | `HISTORY` | 80 000 samples | `SAMPLE_RATE × WINDOW_TIME` |
 | `SPEC_N` | 8000 | Welch segment length = 1 s → 1 Hz resolution |
@@ -144,13 +202,13 @@ Timing constants are defined in `stream.py`, control-law tuning in `control.py`;
 `imu_visualizer.py` imports what it displays.
 
 ### Architecture
-- `SerialWorker` (QThread) — reads 4096-byte chunks from USB CDC, parses 10-byte frames, emits `batch_ready(samples, drops)`; emits `failed(str)` if the port cannot be opened or is lost
+- `SerialWorker` (QThread) — reads 4096-byte chunks from USB CDC, parses 10-byte frames, emits `batch_ready(samples, drops)`; emits `info_ready(str)` for each firmware status line; emits `failed(str)` if the port cannot be opened or is lost
 - `DemoWorker` (QThread) — synthetic 50 Hz + 120 Hz + 1 kHz signals for offline testing
 - `WelchRunnable` (QRunnable) — Welch PSD on thread pool (50% overlap, Hann window, `scaling='density'`)
 - `AudioOutputWorker` (QThread) — IFFT-shaped Gaussian noise → sounddevice OutputStream; `render()` makes one block and is what the tests call; emits `failed(str)` if the stream cannot be opened
 - `MainWindow` — 30 Hz display timer, plots, and the glue: stream → Welch → controller → audio worker. Central widget is a tab pair, **Live** (plots) and **Settings**
 - `TestProfileDock` (QDockWidget) — PSD breakpoint table, test sequence, the 1 Hz timer that ticks the `SequenceRunner`, the level slider, the audio worker
-- `MeasurementStream` (`stream.py`) — `push(batch)`, `take_window()`, `restart_control_window()`, `reset()`
+- `MeasurementStream` (`stream.py`) — `push(batch)`, `take_window()`, `restart_control_window()`, `reset()`, `set_input_rate(hz)`; holds a `Resampler` when the input is not at exactly 8000 Hz
 - `SpectralController` (`control.py`) — `update(meas_psd, breakpoints, gain_db, drive_active)`, `reseed_level()`, `output_dbfs()`, `reset()`, `load_response()` / `save_response()`
 - `SpecAssessor` (`control.py`) — `add(meas_psd, …)`, `status()` → `SpecStatus`
 - `SequenceRunner` (`sequence.py`) — `start/pause/resume/stop/tick`, `gain_db`, `set_steps`, `plan`
@@ -170,7 +228,7 @@ array. They cannot disagree. (The readout used to *sum* channels while the loop 
 mean — √N apart with N channels.)
 
 ### PSD computation
-- Welch uses `fs = SAMPLE_RATE = 8000.0` (constant, not measured) — serial chunked reads make wall-clock FS estimation unreliable (parsing time ≈ µs, not the 125 µs sample period)
+- Welch uses `fs = SAMPLE_RATE = 8000.0` (constant). That is exact because the stream is resampled to it; the host never estimates the rate from serial timing itself — chunked reads make that unreliable over short spans (parsing time ≈ µs, not the 125 µs sample period)
 - x-axis: pre-log10 frequencies passed to `LogHzAxis` — `setLogMode` must NOT be used (causes double log10)
 - y-axis: **PSD is displayed in g²/Hz, not dB.** Curves are fed `np.log10(psd)` and
   `LogPSDAxis` formats the ticks back to plain g²/Hz (`1e-4`, `1e-3`, …). Same
@@ -179,6 +237,68 @@ mean — √N apart with N channels.)
   Max-corr clamp are all dB power. Only the display is g²/Hz. When plotting the drive
   curve the conversion is `log10(demand) + H_corr_db / 10`; the `/10` is not optional.
 - `_plot_freqs` and `_plot_mask` use `np.fft.rfftfreq(SPEC_N, 1/fs)`, same bins as scipy Welch output
+
+### Sensor sample rate — measured, reported, resampled
+
+The ICM-42688-P's 8 kHz ODR comes from its internal oscillator. On the development
+unit it is **8107.41 Hz** (firmware, against the MCU crystal) = 8107.8 Hz (PC clock) —
+two clocks, agreeing to 50 ppm. It holds to ±0.005 Hz over minutes.
+
+The firmware delivers every sensor sample once, so the stream arrives at that rate, and
+`MeasurementStream` resamples it to exactly 8000 Hz before anything else sees it:
+
+- `SerialWorker.info_ready` → `MainWindow._on_serial_info` → `banner_rate()` →
+  `MeasurementStream.set_input_rate()`.
+- The **first** report of a session changes the rate by more than
+  `INPUT_RATE_RESET_FRAC` (0.1 %), so the stream is reset (the ≤0.5 s gathered so far was
+  on the wrong time base) and `_psd` / the in-spec average are dropped. Later reports
+  differ by a few ppm and are just followed.
+- A new connection goes back to the nominal rate until that device reports its own, so
+  older firmware (no status line, MCU-timed at 8000 Hz) still works unchanged.
+- `Resampler` is windowed-sinc interpolation, 64 taps, Kaiser β = 9: tones keep their
+  frequency to 0.02 Hz and their level to 0.01 dB up to 3 kHz, the passband is flat to
+  3.3 kHz, and nothing above 4 kHz folds back (−89 dB). Above 3.3 kHz it rolls off —
+  the display is not meaningful there. Cost ≈ 1 % of a core.
+- The toolbar reads `FS: 8000 Hz (sensor 8107.4 Hz, resampled)`; the status line is its
+  tooltip.
+
+**Do not "simplify" this by relabelling the frequency axis or dropping the resampler.**
+Unresampled, every frequency reads 1.33 % low (2000 Hz shows at 1973 Hz), so the top
+27 Hz of a 20–2000 Hz profile never sees any drive and the loop pins those bins on the
+boost rail. Verified on the rig with ambient lines: 1737 / 2606 Hz under the old
+firmware, 1714 / 2571 Hz unresampled, 1737 / 2606 Hz again through the resampler.
+
+### Sensor frequency response — measured
+
+Measured from the at-rest noise floor (the sensor's own noise is white, so its shape is
+the sensor's filtering; `python tools/hw_check.py noise <port>`). dB relative to
+100–300 Hz, mean of the three axes:
+
+| Band (Hz) | Reset-default filters | As configured |
+|---|---|---|
+| 300–600 | −0.4 | −0.1 |
+| 600–1000 | −1.7 | −0.3 |
+| 1000–1400 | −4.6 | −0.9 |
+| 1400–2000 | **−9.2** | **−1.9** |
+| 2000–3000 | −16.2 | −3.8 |
+| 3000–3900 | −22.4 | −7.8 |
+
+- The reset defaults (AAF ≈ 1.2 kHz, UI filter ODR/4) roll off well inside a 20–2000 Hz
+  profile. The loop reads that as the rig's response and over-drives the top of the
+  band by the same amount. They are therefore opened to their widest at init.
+- **The remaining −1.9 dB at 1.4–2 kHz cannot be configured away at 8 kHz ODR.** UI
+  filter order (1st/2nd/3rd), UI bandwidth code (0, 14, 15) and AAF on/off were all
+  tried on the hardware: identical below 2 kHz. It belongs to the sensor's fixed
+  decimation chain at this ODR. A flatter response needs the sensor run at 16 or 32 kHz
+  and decimated in the MCU, or a correction on the host (issue #17).
+- So the top third-octave of a 2 kHz profile is still driven ≈ 2 dB harder than
+  indicated. Until #17 is done, treat readings above 1 kHz as that much low.
+- The price of the wider AAF is alias rejection. Not measured — it needs a source above
+  4 kHz — but from the in-band slopes, content at 6–8 kHz, which folds back into
+  0–2 kHz, is probably attenuated by something like 15–20 dB now against 30 dB or more
+  with the default filter. The drive is band-limited to the profile, so only harmonics
+  and rattles live up there.
+- DC gain is unaffected: |g| at rest reads 0.9997–1.0002 g with every setting tried.
 
 ### Spectrum display
 
@@ -576,6 +696,11 @@ PyOpenGL>=3.1
 | Rig settles ~0.8 dB above demand with error reading zero | Level servo nulled the mean of dB errors, which is biased low | Level error from linear in-band power |
 | Meas Grms √2 / √3 above demand with 2 / 3 control channels | Readout summed channels, loop used their mean | One mean PSD for readout, status and loop; band-limited Grms |
 | `speaker_response.json … NOT loaded` in the status bar | Saved curve is mostly outside the clamp — a wound-up integrator, not a response | Relearn with the loop, then Save |
+| Every frequency reads 1.3 % low; top edge of the profile band saturates | Stream arriving at the sensor's 8107 Hz but treated as 8000 Hz — status line not reaching `set_input_rate` (old host, or parser dropped it) | Toolbar must read `FS: 8000 Hz (sensor … Hz, resampled)` within 2 s of connecting |
+| Toolbar stays at `FS: 8000 Hz (configured)` | Firmware older than 2026-10-08 (no status line) | Works, but that firmware skips ~107 samples/s and has the default filters — flash the current one |
+| Spectral lines have sidebands ~108 Hz apart | Firmware reading on an MCU timer instead of once per DRDY | Current firmware; check `tools/hw_check.py info` says `drdy-polled` |
+| Measured PSD droops toward 2 kHz on a rig known to be flat | Sensor filters at reset defaults (−9 dB at 1.4–2 kHz) | `tools/hw_check.py info` must show `now=01,0D,7E,80,3F` |
+| 4 flashes on the LED | Accel filter registers did not read back | SPI integrity; bank select not returned to 0 |
 | Host shows `Drops: 0` across a USB stall | `seq` was assigned at transmit, after the ring dropped samples | `seq` stamped at acquisition on Core 0 |
 | `PICO_BOARD` not found at configure | Board is named `pimoroni_pico_plus2_rp2350` in SDK 2.2.0 | Use that name |
 | Sustained Grms limit cycle (~14 s period, rail-to-rail drive), unaffected by `loop_gain` | Loop updated at ~100 Hz against a 10 s moving-average measurement — ~1000 updates per measurement refresh, so every gain saturated to effective 1.0 | Welch over the most recent `CTRL_SAMPLES` (2 s) only, launched once per that many *new* samples → each update sees a fresh non-overlapping window. Also cut Welch CPU 200× |

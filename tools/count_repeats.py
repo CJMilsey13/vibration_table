@@ -34,9 +34,17 @@ SAMPLE_RATE = 8000.0
 
 def parse_frames(data: bytes) -> tuple[np.ndarray, np.ndarray]:
     """→ (seq uint16 array, samples int16 array of shape (n, 3)). Resyncs on
-    the sync word, so a capture may start or end mid-frame."""
+    the sync word, so a capture may start or end mid-frame, and may hold the
+    firmware's '#' text lines between frames."""
+    seqs, samples, _ = parse_frames_at(data)
+    return seqs, samples
+
+
+def parse_frames_at(data: bytes) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """parse_frames, plus the byte offset at which each frame ends."""
     seqs: list[int] = []
     rows: list[tuple[int, int, int]] = []
+    ends: list[int] = []
     i, n = 0, len(data)
     while i + FRAME_BYTES <= n:
         if data[i:i + 2] != SYNC:
@@ -49,8 +57,10 @@ def parse_frames(data: bytes) -> tuple[np.ndarray, np.ndarray]:
         seqs.append(seq)
         rows.append((ax, ay, az))
         i += FRAME_BYTES
+        ends.append(i)
     return (np.asarray(seqs, dtype=np.uint16),
-            np.asarray(rows, dtype=np.int16).reshape(-1, 3))
+            np.asarray(rows, dtype=np.int16).reshape(-1, 3),
+            np.asarray(ends, dtype=np.int64))
 
 
 def analyse(seqs: np.ndarray, samples: np.ndarray) -> dict:

@@ -15,17 +15,23 @@ The three high-severity tickets share one effect: the shaker can be driven harde
 
 Fix these before the next run on the rig. Until then: keep the loop disabled while the drive is off, stop the drive by hand before pressing Stop, and delete `speaker_response.json`.
 
-## Fix status (2026-10-07, same day)
+## Fix status (updated 2026-10-08)
 
-13 tickets fixed and tested, 1 fixed and built but not run on hardware, 2 still open.
-Each ticket file ends with a Resolution section naming its tests.
+All 16 tickets are fixed. One new ticket, 17, is open.
+Each ticket file ends with a Resolution section naming its tests and measurements.
 
 | # | Status |
 |---|---|
-| 01–07, 09–13, 16 | Fixed. Covered by `python -m pytest tests` (98 tests, no hardware needed). |
-| 08 | Firmware changed and builds clean. Not flashed. Confirm at the rig that stalling the host shows a non-zero `Drops:`. |
-| 14 | Open. Run `python tools/count_repeats.py <port>` with the rig still to measure it. |
-| 15 | Open. Datasheet reset values still unconfirmed. |
+| 01–07, 09–13, 16 | Fixed 2026-10-07. Covered by `python -m pytest tests` (123 tests, no hardware needed). |
+| 08 | Fixed and measured on the rig 2026-10-08. A host stall is fully reported; the stale 512 ms at first connection is gone. |
+| 14 | Fixed and measured on the rig 2026-10-08. The sensor runs at 8107.4 Hz, not 8000; the old firmware skipped about 107 samples a second. Now one read per sample, and the host resamples to exactly 8000 Hz. |
+| 15 | Fixed as far as the sensor allows, measured on the rig 2026-10-08. Response at 1.4–2 kHz went from −9.2 dB to −1.9 dB. |
+| 17 | **Open.** The remaining −1.9 dB at 1.4–2 kHz cannot be configured away at 8 kHz output rate. Options are in the ticket. |
+
+Firmware `2026-10-08` is flashed on the development unit. The firmware it replaced is
+`firmware/build/icm42688_streamer.uf2` (May 2026). The new firmware must be used with
+the visualizer from the same commit: an older visualizer would show every frequency
+1.33 % low.
 
 The Python logic moved out of the widgets into three Qt-free modules: `control.py`,
 `stream.py` and `sequence.py`. CLAUDE.md describes them and who owns which state.
@@ -124,8 +130,9 @@ Each ticket is a file in `issues/` with location, reproduction, suggested fix an
 - **GitHub issues:** filed on 2026-10-08 as
   [CJMilsey13/vibration_table #1–#16](https://github.com/CJMilsey13/vibration_table/issues).
   Issue number N is ticket N. The fixes are on branch `fix/code-review-tickets`.
-  #1–#7, #9–#13 and #16 are closed with their resolution notes. #8 stays open until the
-  firmware is flashed and checked; #14 and #15 are open.
-- Nothing was tested on the rig. The new firmware has not been flashed.
+  #1–#16 are closed with their resolution notes. #17 is open.
+- The shaker was never driven. Every rig measurement was of the sensor at rest; the
+  closed loop has only been run against simulated rigs.
+- Alias rejection above 4 kHz with the wider sensor filter was not measured.
 - `speaker_response.json` was left on disk. The app now refuses to load it.
 - The branch is not merged into `main`.

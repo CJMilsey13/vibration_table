@@ -20,10 +20,30 @@ Route DRDY to INT1 and sample on the interrupt (or poll the INT pin), so there i
 
 Alternatively, correct the header comment and remove the unused defines if polling is the intended design.
 
-## Resolution (2026-10-07)
+## Resolution (2026-10-08)
 
-**Open — needs a capture from the rig.**
+**Fixed and verified on the hardware.** Firmware `2026-10-08` plus a host change.
 
-The firmware header comment now says sampling is polled. `tools/count_repeats.py <port>` was added to measure the repeat rate with the rig still. No change to the sampling itself.
+**What was measured.** The sensor does not run at 8000 Hz. Its 8 kHz output rate comes from its internal oscillator and is **8107.41 Hz** on this unit (firmware, against the MCU crystal; 8107.8 Hz by the PC clock, so two clocks agree to 50 ppm). The old firmware read at 8000.1 Hz, so about **107 samples every second were never read**, and about 5 a second were read twice. This was worse than the ticket supposed.
 
-Tests: `test_serial.py::test_count_repeats_finds_duplicated_samples` (the tool, on synthetic frames)
+**Firmware.** Core 0 now reads exactly one sample per sensor data-ready, by polling `UI_DRDY` in `INT_STATUS` over SPI. No INT1 wire is needed. It measures the sensor's rate and reports it every 2 s in a text status line between frames (`odr=8107.411`).
+
+**Host.** The stream now arrives at the sensor's rate, so `MeasurementStream` resamples it to exactly 8000 Hz using the reported rate. Without that, every frequency would read 1.33 % low.
+
+Measured on the rig:
+
+| | Old firmware | New firmware |
+|---|---|---|
+| Frames per second (PC clock) | 8000.14 | 8107.75 |
+| Samples read twice (excess over chance) | 5.3 per second | 0.00 per second |
+| Samples missed | ~107 per second, unreported | 0 in 1,459,481 frames (180 s) |
+| Sidebands ±107 Hz beside the 1737 Hz ambient line | +3.0 / +2.3 dB over the floor | +0.1 / +0.3 dB |
+| Stream rate after the host resampler (PC clock) | n/a | 8000.26 per second (+33 ppm) |
+
+Frequency axis, checked with ambient lines on the rig: 1737 and 2606 Hz under the old firmware; 1714 and 2571 Hz from the new firmware unresampled (ratio 0.9867, as predicted by 8000/8107.4); 1737 and 2606 Hz again through the real `SerialWorker` and resampler.
+
+Resampler: a tone keeps its frequency to 0.02 Hz and its level to 0.01 dB from 20 Hz to 3 kHz; flat to 3.3 kHz; nothing above 4 kHz folds back (−89 dB).
+
+Tests: `tests/test_resample.py` (18 tests), `tests/test_serial.py::test_status_line_*`, `tests/test_gui.py::test_status_line_sets_the_stream_rate_and_says_so`, `::test_a_new_connection_starts_from_the_nominal_rate_again`, `::test_sensor_rate_stream_shows_a_tone_at_its_true_frequency`.
+
+Do not use the new firmware with a visualizer older than this change: it would show every frequency 1.33 % low.

@@ -10,7 +10,9 @@ Hardware:      ICM-42688-P via SPI → Pimoroni Pico Plus 2 (RP2350) → USB CDC
 
 Wire protocol (firmware → host):
   [0xAA][0x55] | seq uint16 LE | ax int16 LE | ay int16 LE | az int16 LE
-  = 10 bytes per sample at 8 kHz nominal
+  = 10 bytes per sample, at the SENSOR's rate (8 kHz nominal, ~8108 Hz actual)
+  Between frames the firmware sends a '#' status line every 2 s carrying
+  odr=<measured rate>; the stream is resampled to exactly 8000 Hz from it.
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ from control import (
 from sequence import SequenceRunner
 from stream import (
     CTRL_WINDOW_S, DISPLAY_WELCH_HZ, HISTORY, PSD_FMAX, PSD_FMIN,
-    SAMPLE_RATE, SPEC_N, WINDOW_TIME, MeasurementStream, Window,
+    SAMPLE_RATE, SPEC_N, WINDOW_TIME, MeasurementStream, Window, banner_rate,
 )
 
 try:
@@ -126,6 +128,9 @@ class LogPSDAxis(pg.AxisItem):
 class SerialWorker(QtCore.QThread):
     batch_ready = QtCore.pyqtSignal(object, int)   # samples, dropped frames
     failed      = QtCore.pyqtSignal(str)           # port could not be opened / was lost
+    info_ready  = QtCore.pyqtSignal(str)           # a '# icm42688_streamer …' status line
+
+    BANNER = b'# icm42688_streamer'
 
     def __init__(self, port: str, baud: int, sensitivity: float) -> None:
         super().__init__()
@@ -145,6 +150,7 @@ class SerialWorker(QtCore.QThread):
         last_seq: Optional[int] = None
         scale    = 1.0 / self.sensitivity
         pending  = bytearray()
+        text     = bytearray()      # bytes that were not part of a frame
 
         try:
             ser = serial.Serial(self.port, self.baud, timeout=0.1)
@@ -159,10 +165,15 @@ class SerialWorker(QtCore.QThread):
                 while len(pending) >= FRAME_BYTES:
                     sync_pos = pending.find(SYNC)
                     if sync_pos < 0:
+                        text.extend(pending[:-1])
                         pending = pending[-1:]
                         break
                     if sync_pos > 0:
+                        # Not a frame: the firmware's status line, or garbage.
+                        text.extend(pending[:sync_pos])
                         pending = pending[sync_pos:]
+                    if text:
+                        self._scan_text(text)
                     if len(pending) < FRAME_BYTES:
                         break
 
@@ -188,6 +199,20 @@ class SerialWorker(QtCore.QThread):
             ser.close()
         except serial.SerialException as exc:
             self.failed.emit(str(exc))
+
+    def _scan_text(self, text: bytearray) -> None:
+        """Emit any complete status line held in `text`, and consume it."""
+        while True:
+            end = text.find(b'\n')
+            if end < 0:
+                break
+            line = bytes(text[:end])
+            del text[:end + 1]
+            at = line.find(self.BANNER)
+            if at >= 0:
+                self.info_ready.emit(line[at:].decode('ascii', 'replace').strip())
+        if len(text) > 512:             # never a line — do not let it grow
+            del text[:-512]
 
     def stop(self) -> None:
         self._running = False
@@ -1826,17 +1851,40 @@ class MainWindow(QtWidgets.QMainWindow):
     def _start_worker(self, worker: SerialWorker | DemoWorker) -> None:
         # New session: clear the stream — data, filter state and BOTH Welch
         # gates together — and everything that was averaged from the old one.
+        # Assume the nominal rate again until this device says otherwise.
+        self._stream.set_input_rate(SAMPLE_RATE)
         self._stream.reset()
         self._psd = None
         self._assessor.reset()
+        self._fs_lbl.setText(f'FS: {SAMPLE_RATE:.0f} Hz (configured)')
+        self._fs_lbl.setToolTip('')
         self.worker = worker
         self.worker.batch_ready.connect(self._on_batch)
         if isinstance(worker, SerialWorker):
             worker.failed.connect(self._on_serial_failed)
+            worker.info_ready.connect(self._on_serial_info)
         self.worker.start()
         if self.demo:
             self._status_lbl.setText('●  DEMO')
             self._status_lbl.setStyleSheet('color: #fa0;')
+
+    @QtCore.pyqtSlot(str)
+    def _on_serial_info(self, line: str) -> None:
+        """The firmware's status line: adopt the sensor rate it measured."""
+        if self.sender() is not self.worker:
+            return
+        rate = banner_rate(line)
+        if rate is None:
+            return
+        if self._stream.set_input_rate(rate):
+            # The stream restarted on the right time base; what was averaged
+            # from the old one is on the wrong frequency axis.
+            self._psd = None
+            self._assessor.reset()
+            self._profile_dock.update_spec_status(None)
+        self._fs_lbl.setText(
+            f'FS: {SAMPLE_RATE:.0f} Hz (sensor {rate:.1f} Hz, resampled)')
+        self._fs_lbl.setToolTip(line)
 
     @QtCore.pyqtSlot(str)
     def _on_serial_failed(self, message: str) -> None:

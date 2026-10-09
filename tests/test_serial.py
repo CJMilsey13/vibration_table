@@ -34,12 +34,14 @@ class FakeSerial:
         pass
 
 
-def run_worker(iv, monkeypatch, data):
+def run_worker(iv, monkeypatch, data, infos=None):
     w = iv.SerialWorker('FAKE', 115200, 2048.0)
     monkeypatch.setattr(iv.serial, 'Serial', lambda *a, **k: FakeSerial(data, w))
     batches, failures = [], []
     w.batch_ready.connect(lambda b, d: batches.append((b, d)))
     w.failed.connect(failures.append)
+    if infos is not None:
+        w.info_ready.connect(infos.append)
     w.run()
     assert not failures
     return batches
@@ -74,6 +76,42 @@ def test_parser_resyncs_after_garbage(iv, monkeypatch):
     assert len(batches) == 2 and sum(d for _, d in batches) == 0
 
 
+# ── Firmware status line ─────────────────────────────────────────────────────
+
+BANNER = (b'# icm42688_streamer 2026-10-08 drdy-polled odr=8107.419 '
+          b'reset=11,0D,30,40,62 now=01,0D,7E,80,3F\n')
+
+
+def test_status_line_between_frames_is_reported_and_costs_no_frames(iv, monkeypatch):
+    data = (BANNER + b''.join(frame(s, az=2048) for s in range(400)) +
+            BANNER + b''.join(frame(s, az=2048) for s in range(400, 800)))
+    infos = []
+    batches = run_worker(iv, monkeypatch, data, infos)
+    assert len(batches) == 10 and sum(d for _, d in batches) == 0
+    assert np.allclose(np.concatenate([b for b, _ in batches])[:, 2], 1.0)
+    assert infos == [BANNER.decode().strip()] * 2
+    from stream import banner_rate
+    assert banner_rate(infos[0]) == 8107.419
+
+
+def test_status_line_split_across_reads_is_still_found(iv, monkeypatch):
+    # FakeSerial hands out 4096-byte chunks; put the line across a boundary.
+    lead = b''.join(frame(s) for s in range(407))            # 4070 bytes
+    data = lead + BANNER + b''.join(frame(s) for s in range(407, 880))
+    assert len(lead) < 4096 < len(lead) + len(BANNER)
+    infos = []
+    batches = run_worker(iv, monkeypatch, data, infos)
+    assert sum(d for _, d in batches) == 0 and len(batches) == 11
+    assert infos == [BANNER.decode().strip()]
+
+
+def test_garbage_is_not_reported_as_a_status_line(iv, monkeypatch):
+    infos = []
+    data = b'\x00\x01 not a banner\n' + b''.join(frame(s) for s in range(160))
+    run_worker(iv, monkeypatch, data, infos)
+    assert infos == []
+
+
 # ── tools/count_repeats.py ───────────────────────────────────────────────────
 
 def test_count_repeats_finds_duplicated_samples(rng):
@@ -97,3 +135,9 @@ def test_count_repeats_counts_sequence_gaps():
     r = analyse(seqs, samples)
     assert r['dropped'] == 3 and r['repeats'] == 0
     assert analyse(seqs[:1], samples[:1])['frames'] == 1
+
+
+def test_parse_frames_skips_the_status_line():
+    data = BANNER + frame(7, 1, 2, 3) + BANNER + frame(8, 4, 5, 6)
+    seqs, samples = parse_frames(data)
+    assert list(seqs) == [7, 8] and samples.tolist() == [[1, 2, 3], [4, 5, 6]]

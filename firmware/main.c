@@ -1,14 +1,23 @@
 /*
  * ICM-42688-P → RP2350 dual-core → USB CDC streamer
  * ==================================================
- * Core 0  Initialises IMU over SPI; polls it on a 125 µs timer (8 kHz) and
- *         pushes raw int16 triplets, each stamped with a sequence number,
- *         into a lock-free SPSC ring buffer. INT1 is NOT used.
+ * Core 0  Initialises IMU over SPI, then reads exactly one sample per sensor
+ *         data-ready (DRDY polled over SPI in INT_STATUS — the INT1 pin is
+ *         NOT used or needed) and pushes raw int16 triplets, each stamped
+ *         with a sequence number, into a lock-free SPSC ring buffer.
  * Core 1  Drains the ring buffer; formats 10-byte binary frames;
  *         writes them to the host over USB CDC (stdio_usb).
  *
  * Wire protocol (little-endian):
  *   [0xAA][0x55] | seq uint16 | ax int16 | ay int16 | az int16   = 10 bytes
+ *   Every BANNER_EVERY frames one ASCII line starting with '#' is sent
+ *   between frames: firmware id, the sensor's filter registers, and odr= the
+ *   sensor's measured sample rate in Hz. Hosts that do not want it skip it by
+ *   synchronising on 0xAA 0x55, as they already must.
+ *
+ * The frame rate is the SENSOR's output data rate — nominally 8 kHz, but set
+ * by the sensor's own oscillator and about 1.3 % fast on the unit this was
+ * developed with (8108 Hz). The host resamples to exactly 8000 Hz using odr=.
  *
  * Default pin assignments (adjust to your board wiring):
  *   SPI0  SCK  GP18   MOSI GP19   MISO GP16   CS GP17
@@ -41,15 +50,50 @@
 #define ICM_REG_TEMP_DATA1      0x1Du   /* temperature MSB; LSB at 0x1E */
 #define ICM_REG_REG_BANK_SEL    0x76u   /* [1:0] BANK_SEL; 0 = bank 0 (default) */
 #define ICM_REG_ACCEL_DATA_X1   0x1Fu   /* first byte of 6-byte accel burst */
-#define ICM_REG_INT_STATUS      0x2Du   /* bit 3 = UI_DRDY_INT */
+#define ICM_REG_INT_STATUS      0x2Du   /* bit 3 = UI_DRDY_INT, cleared by reading */
+#define ICM_INT_STATUS_DRDY     0x08u
 #define ICM_REG_INTF_CONFIG1    0x4Du   /* [1:0] CLKSEL; default 0x91 */
 #define ICM_REG_PWR_MGMT0       0x4Eu
 #define ICM_REG_GYRO_CONFIG0    0x4Fu   /* [7:5] GYRO_FS_SEL  [3:0] GYRO_ODR */
 #define ICM_REG_ACCEL_CONFIG0   0x50u
+#define ICM_REG_GYRO_ACCEL_CONFIG0  0x52u   /* [7:4] ACCEL_UI_FILT_BW  [3:0] GYRO_UI_FILT_BW */
+#define ICM_REG_ACCEL_CONFIG1   0x53u   /* [4:3] ACCEL_UI_FILT_ORD */
 #define ICM_REG_INT_CONFIG      0x14u
 #define ICM_REG_INT_SOURCE0     0x65u
 #define ICM_REG_WHO_AM_I        0x75u
 #define ICM_WHO_AM_I_EXPECTED   0x47u
+
+/* ── ICM-42688-P register map (bank 2) — accel anti-alias filter ───────────── */
+#define ICM_REG_ACCEL_CONFIG_STATIC2  0x03u   /* [6:1] ACCEL_AAF_DELT  [0] ACCEL_AAF_DIS */
+#define ICM_REG_ACCEL_CONFIG_STATIC3  0x04u   /* ACCEL_AAF_DELTSQR[7:0] */
+#define ICM_REG_ACCEL_CONFIG_STATIC4  0x05u   /* [7:4] ACCEL_AAF_BITSHIFT  [3:0] ACCEL_AAF_DELTSQR[11:8] */
+
+/*
+ * Accelerometer filters.
+ *
+ * Out of reset the accel path is band-limited well inside the 20–2000 Hz test
+ * band: a 2nd-order anti-alias filter (AAF) near 1.2 kHz followed by a UI
+ * filter at ODR/4 = 2 kHz. Measured on this rig from the at-rest noise floor,
+ * the response was −4.6 dB at 1.0–1.4 kHz and −9 dB at 1.4–2.0 kHz. A control
+ * loop reading that as the rig's response over-drives the top of the band by
+ * the same amount.
+ *
+ * So both are opened as far as they go:
+ *   AAF        DELT 63, DELTSQR 3968, BITSHIFT 3  → 3979 Hz (the widest setting)
+ *   UI filter  ACCEL_UI_FILT_BW = 0               → ODR/2 = 4 kHz
+ * The gyro's UI filter nibble is left at its reset value (1).
+ *
+ * These live in bank 2 / are static configuration: they are written while the
+ * sensors are still OFF, i.e. before PWR_MGMT0.
+ */
+#define ICM_ACCEL_AAF_DELT       63u
+#define ICM_ACCEL_AAF_DELTSQR    3968u
+#define ICM_ACCEL_AAF_BITSHIFT   3u
+#define ICM_ACCEL_STATIC2_VALUE  ((uint8_t)(ICM_ACCEL_AAF_DELT << 1))                /* AAF enabled */
+#define ICM_ACCEL_STATIC3_VALUE  ((uint8_t)(ICM_ACCEL_AAF_DELTSQR & 0xFFu))
+#define ICM_ACCEL_STATIC4_VALUE  ((uint8_t)((ICM_ACCEL_AAF_BITSHIFT << 4) | (ICM_ACCEL_AAF_DELTSQR >> 8)))
+#define ICM_GYRO_ACCEL_CONFIG0_VALUE  0x01u   /* accel UI BW = ODR/2, gyro UI BW = reset default */
+#define ICM_ACCEL_CONFIG1_VALUE       0x0Du   /* reset value: 2nd-order UI filter */
 
 /*
  * ACCEL_CONFIG0 (0x50):
@@ -78,6 +122,10 @@
 #define ICM_PWR_ACCEL_LN_GYRO_LN  0x0Fu
 
 /*
+ * INT1 is not used: sampling is paced by polling UI_DRDY in INT_STATUS, which
+ * needs no extra wire. The two definitions below are kept for a future
+ * interrupt-driven build only.
+ *
  * INT_CONFIG (0x14) bits [2:0] for INT1:
  *   [2] INT1_MODE          0=pulsed
  *   [1] INT1_DRIVE_CIRCUIT 1=push-pull
@@ -92,6 +140,7 @@
 #define ICM_DRDY_INT1_EN  0x10u
 
 /* ── Wire protocol ─────────────────────────────────────────────────────────── */
+#define FW_VERSION  "2026-10-08"
 #define SYNC_A  0xAAu
 #define SYNC_B  0x55u
 #define FRAME_BYTES  10u   /* 2 sync + 2 seq + 6 accel */
@@ -121,6 +170,21 @@ static volatile uint32_t ring_rd = 0u;   /* written only by Core 1 */
  * Numbering frames at transmit time instead would hide every overrun.
  */
 static uint16_t acq_seq = 0u;
+
+/*
+ * The sensor's output data rate in milli-hertz, measured on Core 0 against
+ * this MCU's crystal by counting samples over a few seconds. 0 until the
+ * first measurement is in (about 1 s after boot). Read by Core 1 for the
+ * banner; a single aligned 32-bit word, so no lock is needed.
+ */
+static volatile uint32_t odr_mhz = 0u;
+
+/* Samples the sensor produced that Core 0 never read. They get sequence
+ * numbers too, so the host counts them as drops like any other lost sample. */
+static inline void ring_skip(uint32_t missed)
+{
+    acq_seq = (uint16_t)(acq_seq + missed);
+}
 
 static inline bool ring_full(void)
 {
@@ -190,6 +254,7 @@ static void icm_burst_read6(uint8_t reg, uint8_t *dst)
 /* Call to halt with a repeating blink pattern. Count the flashes per burst:
  *   2 flashes = WHO_AM_I mismatch        (wrong chip or SPI not connected)
  *   3 flashes = PWR_MGMT0 write fail     (accel enable didn't stick)
+ *   4 flashes = filter config readback   (AAF / UI filter write didn't stick)
  *   5 flashes = DRDY timeout (500 ms)    (ODR timer / analog chain not started)
  *   6 flashes = DRDY ok, all data 0x8000 (accel + temp — likely MISO stuck low)
  *   7 flashes = DRDY ok, temp valid, accel 0x8000  (ADC chain not converting)
@@ -207,6 +272,10 @@ static void blink_fault(uint count)
         sleep_ms(800);   /* pause between bursts */
     }
 }
+
+/* Filter registers as found after soft reset, before this firmware changed
+ * them. Reported in the banner so the host can see what the part defaults to. */
+static uint8_t icm_reset_cfg[5];   /* GYRO_ACCEL_CONFIG0, ACCEL_CONFIG1, STATIC2, STATIC3, STATIC4 */
 
 /* ── IMU initialisation ─────────────────────────────────────────────────────── */
 static bool icm_init(void)
@@ -231,6 +300,30 @@ static bool icm_init(void)
     icm_write(ICM_REG_GYRO_CONFIG0,  0x03u);              /* ±2000 dps, 8 kHz */
     sleep_ms(1);
 
+    /* Accel filters — also BEFORE enabling: bank-2 registers must only be
+     * written with accel and gyro off. Note what the part reset to first. */
+    icm_reset_cfg[0] = icm_read_byte(ICM_REG_GYRO_ACCEL_CONFIG0);
+    icm_reset_cfg[1] = icm_read_byte(ICM_REG_ACCEL_CONFIG1);
+    icm_write(ICM_REG_REG_BANK_SEL, 0x02u);
+    icm_reset_cfg[2] = icm_read_byte(ICM_REG_ACCEL_CONFIG_STATIC2);
+    icm_reset_cfg[3] = icm_read_byte(ICM_REG_ACCEL_CONFIG_STATIC3);
+    icm_reset_cfg[4] = icm_read_byte(ICM_REG_ACCEL_CONFIG_STATIC4);
+    icm_write(ICM_REG_ACCEL_CONFIG_STATIC2, ICM_ACCEL_STATIC2_VALUE);
+    icm_write(ICM_REG_ACCEL_CONFIG_STATIC3, ICM_ACCEL_STATIC3_VALUE);
+    icm_write(ICM_REG_ACCEL_CONFIG_STATIC4, ICM_ACCEL_STATIC4_VALUE);
+    const bool aaf_ok =
+        icm_read_byte(ICM_REG_ACCEL_CONFIG_STATIC2) == ICM_ACCEL_STATIC2_VALUE &&
+        icm_read_byte(ICM_REG_ACCEL_CONFIG_STATIC3) == ICM_ACCEL_STATIC3_VALUE &&
+        icm_read_byte(ICM_REG_ACCEL_CONFIG_STATIC4) == ICM_ACCEL_STATIC4_VALUE;
+    icm_write(ICM_REG_REG_BANK_SEL, 0x00u);               /* back to bank 0 — always */
+    icm_write(ICM_REG_GYRO_ACCEL_CONFIG0, ICM_GYRO_ACCEL_CONFIG0_VALUE);
+    icm_write(ICM_REG_ACCEL_CONFIG1,      ICM_ACCEL_CONFIG1_VALUE);
+    if (!aaf_ok ||
+        icm_read_byte(ICM_REG_GYRO_ACCEL_CONFIG0) != ICM_GYRO_ACCEL_CONFIG0_VALUE ||
+        icm_read_byte(ICM_REG_ACCEL_CONFIG1)      != ICM_ACCEL_CONFIG1_VALUE)
+        blink_fault(4);   /* never returns */
+    sleep_ms(1);
+
     /* Enable accel + gyro LN AFTER configuring ODR/FSR.
      * Gyro LN starts the shared PLL; accel ADC requires it to convert. */
     icm_write(ICM_REG_PWR_MGMT0, ICM_PWR_ACCEL_LN_GYRO_LN);
@@ -243,7 +336,7 @@ static bool icm_init(void)
      * Allow 500 ms; timeout means the ODR timer never started. */
     bool drdy = false;
     for (uint32_t ms = 0u; ms < 500u; ms++) {
-        if (icm_read_byte(ICM_REG_INT_STATUS) & 0x08u) { drdy = true; break; }
+        if (icm_read_byte(ICM_REG_INT_STATUS) & ICM_INT_STATUS_DRDY) { drdy = true; break; }
         sleep_ms(1);
     }
     if (!drdy)
@@ -256,7 +349,7 @@ static bool icm_init(void)
     for (uint32_t attempt = 0u; attempt < 20u; attempt++) {
         /* Wait for the next DRDY */
         for (uint32_t ms = 0u; ms < 10u; ms++) {
-            if (icm_read_byte(ICM_REG_INT_STATUS) & 0x08u) break;
+            if (icm_read_byte(ICM_REG_INT_STATUS) & ICM_INT_STATUS_DRDY) break;
             sleep_ms(1);
         }
 
@@ -304,6 +397,32 @@ static void read_and_push(void)
  */
 #define WRITE_BATCH  64u
 
+/*
+ * One line of text, repeated every BANNER_EVERY frames (2 s). Says which
+ * firmware this is and what the sensor's filter registers were at reset and
+ * are now, in the order GYRO_ACCEL_CONFIG0, ACCEL_CONFIG1, ACCEL_CONFIG_STATIC2,
+ * STATIC3, STATIC4. It is plain ASCII, so it holds no 0xAA byte and cannot be
+ * mistaken for a frame.
+ *
+ * It is repeated rather than sent once at connection because a host opening
+ * the port typically purges its receive buffer just after raising DTR, which
+ * discards anything sent in the first few milliseconds.
+ */
+#define BANNER_EVERY  16000u
+#define BANNER_SECOND  4000u   /* the second one follows the first by 0.5 s */
+
+static void send_banner(void)
+{
+    const uint32_t odr = odr_mhz;
+    printf("# icm42688_streamer " FW_VERSION " drdy-polled odr=%lu.%03lu"
+           " reset=%02X,%02X,%02X,%02X,%02X now=%02X,%02X,%02X,%02X,%02X\n",
+           (unsigned long)(odr / 1000u), (unsigned long)(odr % 1000u),
+           icm_reset_cfg[0], icm_reset_cfg[1], icm_reset_cfg[2],
+           icm_reset_cfg[3], icm_reset_cfg[4],
+           ICM_GYRO_ACCEL_CONFIG0_VALUE, ICM_ACCEL_CONFIG1_VALUE,
+           ICM_ACCEL_STATIC2_VALUE, ICM_ACCEL_STATIC3_VALUE, ICM_ACCEL_STATIC4_VALUE);
+}
+
 static void core1_main(void)
 {
     /* USB CDC is initialised on Core 0 before this core is launched. */
@@ -318,6 +437,9 @@ static void core1_main(void)
 
     uint8_t  out[WRITE_BATCH * FRAME_BYTES];
     uint32_t out_idx = 0u;
+    uint32_t since_banner = BANNER_EVERY;   /* so the first one goes out at once */
+    bool     second_due   = true;           /* ...and a second soon after, in case
+                                             * the host purged the first */
     sample_t s;
 
     while (true) {
@@ -340,6 +462,13 @@ static void core1_main(void)
         out_idx++;
 
         if (out_idx == WRITE_BATCH) {
+            /* Only ever between whole frames, so it cannot split one. */
+            since_banner += WRITE_BATCH;
+            if (since_banner >= BANNER_EVERY) {
+                send_banner();
+                since_banner = second_due ? BANNER_EVERY - BANNER_SECOND : 0u;
+                second_due   = false;
+            }
             fwrite(out, 1u, sizeof(out), stdout);
             fflush(stdout);
             out_idx = 0u;
@@ -348,6 +477,8 @@ static void core1_main(void)
 }
 
 /* ── Core 0: SPI init + IMU sampling ───────────────────────────────────────── */
+#define ODR_PERIOD_US  125u   /* nominal — the sensor's clock sets the real one */
+#define DRDY_QUIET_US   90u   /* no SPI traffic for this long after each sample */
 int main(void)
 {
     /* USB CDC — TinyUSB task runs via USB IRQ, safe to call fwrite from Core 1 */
@@ -372,12 +503,51 @@ int main(void)
 
     multicore_launch_core1(core1_main);
 
-    /* Polling loop — read one sample every 125 µs (= 8 kHz).
-     * SPI burst takes ~7 µs at 8 MHz, leaving ~118 µs of margin. */
-    uint64_t next = time_us_64();
+    /*
+     * Sampling loop — exactly one read per sensor sample.
+     *
+     * The sensor makes samples on its own 8 kHz clock, which is not locked to
+     * this MCU's. Reading on an MCU timer instead (as this loop used to) lets
+     * the two drift through each other: measured here, the same sample was
+     * read twice about 5 times a second. So the sensor paces the loop: wait
+     * for UI_DRDY in INT_STATUS, read, repeat. Reading INT_STATUS clears the
+     * flag, so each sample is taken once and only once.
+     *
+     * DRDY cannot come sooner than one ODR period after the last, so the bus
+     * is left idle for most of the period and polled only when it is due.
+     *
+     * The sample rate is therefore the SENSOR's 8 kHz, not the MCU's. The
+     * host treats it as 8000 Hz nominal.
+     */
+    uint64_t last = time_us_64();
+    uint64_t win_t0  = last;      /* ODR measurement window: start time, */
+    uint32_t win_n   = 0u;        /* sensor samples so far,              */
+    uint32_t win_len = 8192u;     /* and length — short at first, then long */
     while (true) {
+        while (time_us_64() - last < DRDY_QUIET_US) tight_loop_contents();
+        while (!(icm_read_byte(ICM_REG_INT_STATUS) & ICM_INT_STATUS_DRDY)) { /* poll */ }
+
+        /* If this core was held up for two periods or more (USB servicing runs
+         * here), the sensor has overwritten samples we never saw. Number them
+         * so the gap is visible to the host instead of silently closing up.
+         * Rounded down on purpose: a read that is merely late, by less than a
+         * period, has lost nothing and must not be reported as a drop. */
+        const uint64_t now = time_us_64();
+        const uint32_t periods = (uint32_t)((now - last) / ODR_PERIOD_US);
+        if (periods > 1u) ring_skip(periods - 1u);
+        last = now;
+
         read_and_push();
-        next += 125u;
-        while (time_us_64() < next) tight_loop_contents();
+
+        /* Sensor rate against this MCU's crystal: samples per elapsed time.
+         * Over 32768 samples (4 s) the few µs of polling jitter at each end is
+         * about 1 ppm. */
+        win_n += (periods > 1u) ? periods : 1u;
+        if (win_n >= win_len) {
+            odr_mhz = (uint32_t)(((uint64_t)win_n * 1000000000ull) / (now - win_t0));
+            win_t0  = now;
+            win_n   = 0u;
+            win_len = 32768u;
+        }
     }
 }
