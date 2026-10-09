@@ -445,6 +445,59 @@ def test_serial_failure_returns_the_ui_to_disconnected(win, iv, monkeypatch):
     assert 'could not open port' in win.statusBar().currentMessage()
 
 
+# ── Drive ceiling ('1008 debug 2') ───────────────────────────────────────────
+
+def test_drive_at_limit_is_announced_with_the_shortfall(win, rng):
+    d = win._profile_dock
+    d._ctrl_enable_cb.setChecked(True)
+    d._on_audio_start()
+    assert not d._limit_lbl.isVisibleTo(d)
+    for _ in range(4):                               # -20 → -14 → -12 (ceiling), still 9 dB low
+        win._on_fft_done(window(rng, offset_db=-9.0))
+    assert out_dbfs(d) == pytest.approx(-12.0)
+    assert d._limit_lbl.isVisibleTo(d)
+    assert 'DRIVE AT LIMIT' in d._limit_lbl.text() and 'amplifier' in d._limit_lbl.text()
+    short = float(d._limit_lbl.text().split('rig is ')[1].split(' dB')[0])
+    assert short == pytest.approx(9.0, abs=0.3)
+
+    win._on_fft_done(window(rng))                    # rig now on target
+    assert not d._limit_lbl.isVisibleTo(d)
+
+    for _ in range(2):
+        win._on_fft_done(window(rng, offset_db=-9.0))
+    assert d._limit_lbl.isVisibleTo(d)
+    d._on_audio_stop()                               # nothing to be short of
+    assert not d._limit_lbl.isVisibleTo(d)
+
+
+def test_a_step_cannot_push_the_drive_past_the_ceiling(win):
+    d = win._profile_dock
+    d._audio_slider.setValue(-10)
+    set_sequence(d, [(1, -12), (1, -6), (1, 0)])
+    d._start_test()
+    d._timer.stop()
+    assert out_dbfs(d) == pytest.approx(-22.0) and '#aaa' in d._audio_level_lbl.styleSheet()
+    d._tick()
+    assert out_dbfs(d) == pytest.approx(-16.0)
+    d._tick()                                        # 0 dB step would be -10 dBFS
+    assert out_dbfs(d) == pytest.approx(-12.0)
+    assert d._audio_level_lbl.text() == '-12.0 dB' and '#fa0' in d._audio_level_lbl.styleSheet()
+
+
+def test_max_drive_level_is_a_setting(win):
+    d = win._profile_dock
+    assert win._max_drive_spin.value() == win._ctl.max_output_dbfs == -12.0
+    assert '0.00686 %' in win._max_drive_lbl.text() and '52 dB' in win._max_drive_lbl.text()
+    d._audio_slider.setValue(0)
+    d._on_audio_start()
+    assert out_dbfs(d) == pytest.approx(-12.0)       # slider at 0, DAC at the ceiling
+    stale = take_control_window(win)
+    win._max_drive_spin.setValue(-6.0)
+    assert win._ctl.max_output_dbfs == -6.0 and out_dbfs(d) == pytest.approx(-6.0)
+    assert '4.6 %' in win._max_drive_lbl.text() and '20 dB' in win._max_drive_lbl.text()
+    assert not win._stream.is_control_window(stale)  # the drive level jumped
+
+
 # ── Ticket 14: the sensor's own sample rate ──────────────────────────────────
 
 BANNER = ('# icm42688_streamer 2026-10-08 drdy-polled odr=8107.419 '

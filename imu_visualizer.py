@@ -34,9 +34,11 @@ import serial.tools.list_ports
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from control import (
-    CTRL_MAX_CUT_DB, SPEC_AVG_DEFAULT, SPEC_AVG_MAX, TOL_ABORT_DB, TOL_ALARM_DB,
+    CTRL_MAX_CUT_DB, LEVEL_MAX_DBFS_RANGE, SPEC_AVG_DEFAULT, SPEC_AVG_MAX,
+    TOL_ABORT_DB, TOL_ALARM_DB,
     ResponseError, SpecAssessor, SpecStatus, SpectralController,
-    band_grms, band_mask, breakpoint_error, psd_grms, psd_interp_loglog,
+    band_grms, band_mask, breakpoint_error, gaussian_clip, psd_grms,
+    psd_interp_loglog,
 )
 from sequence import SequenceRunner
 from stream import (
@@ -66,6 +68,10 @@ CHANNEL_NAMES = list(CHANNEL_DICT.keys())
 PSD_DISPLAY_TAU_S     = 0.35   # EMA time constant, display only — never control
 
 BATCH    = 80
+# A block counts as clipped once this share of its samples hit the rail. One
+# flattened peak in a few thousand is inaudible and 50 dB down; the indicator
+# is for clipping that is actually distorting the drive.
+CLIP_FRACTION = 5e-3
 PSD_FLOOR_LOG = -12.0   # log10(g²/Hz) placeholder for "no data yet"
 # Spectrum view window, in decades either side of the demand profile. Kept tight
 # on purpose: the ±6 dB tolerance band is only 0.6 of a decade, so a very wide
@@ -295,9 +301,9 @@ class AudioOutputWorker(QtCore.QThread):
     unit RMS before output_gain is applied, so output_gain alone controls the
     DAC level independent of the profile shape or absolute Grms.
 
-    Clip detection fires clip_detected for EVERY block in which a sample
-    exceeds ±1.0 after output_gain scaling, so the indicator stays lit for as
-    long as the clipping lasts.
+    Clip detection fires clip_detected for EVERY block in which more than
+    CLIP_FRACTION of the samples exceed ±1.0 after output_gain scaling, so the
+    indicator stays lit for as long as the clipping lasts.
     """
 
     clip_detected = QtCore.pyqtSignal()
@@ -355,8 +361,9 @@ class AudioOutputWorker(QtCore.QThread):
         sig = _generate_shaped_block(bp, gain, frames, self._fs, rng, corr_f, corr_db)
         sig *= og
 
-        clipped = bool(np.max(np.abs(sig)) > 1.0)
-        if clipped:
+        over    = np.abs(sig) > 1.0
+        clipped = bool(np.mean(over) > CLIP_FRACTION)
+        if over.any():
             np.clip(sig, -1.0, 1.0, out=sig)
         return sig, clipped
 
@@ -429,8 +436,16 @@ def _generate_shaped_block(
         # from the in-band signal.
         f_lo = max(PSD_FMIN, breakpoints[0][0])
         f_hi = min(PSD_FMAX, breakpoints[-1][0], fs * 0.5)
-        mask = (freqs >= f_lo) & (freqs <= f_hi)
+        # ...but the WHOLE band, to its edges. Each drive bin is fs/n wide
+        # (~11 Hz), so a bin is included if any of its width lies in the band:
+        # that is half a bin of slack either side. Stopping at the last bin
+        # centre inside the band leaves up to half a bin at the top with no
+        # drive at all, and the loop then winds those few bins toward the
+        # boost rail chasing energy that is not being made.
+        half = 0.5 * fs / n
+        mask = (freqs >= f_lo - half) & (freqs <= f_hi + half)
     else:
+        f_lo = f_hi = 0.0
         mask = np.zeros(len(freqs), dtype=bool)
     if mask.any():
         df       = fs / n
@@ -439,8 +454,10 @@ def _generate_shaped_block(
             # Interpolate correction onto this block's grid (log-linear).
             # Taper to 0 dB outside the control band — holding a saturated edge
             # value here multiplies out-of-band power by up to 10^(max_corr/10).
+            # A bin centred just outside the band (see `half` above) is there
+            # to drive the band's edge, so it takes the edge's correction.
             c = np.interp(
-                np.log10(freqs[mask]),
+                np.log10(np.clip(freqs[mask], f_lo, f_hi)),
                 np.log10(corr_freqs),
                 corr_db,
                 left=0.0,
@@ -841,6 +858,24 @@ class TestProfileDock(QtWidgets.QDockWidget):
         err_row.addWidget(reset_btn)
         cl_lay.addLayout(err_row)
 
+        # Shown only while the level servo is on its ceiling and still short.
+        self._limit_lbl = QtWidgets.QLabel('')
+        self._limit_lbl.setWordWrap(True)
+        self._limit_lbl.setStyleSheet(
+            'font-family: Consolas; font-weight: bold; color: #f44; '
+            'border: 1px solid #f44; padding: 3px;')
+        self._limit_lbl.setToolTip(
+            'The drive is at the highest level the PC is allowed to send\n'
+            '(Settings → Max drive level) and the rig is still below demand.\n'
+            'Sequence steps cannot raise it further from here.\n'
+            '\n'
+            'Turn the AMPLIFIER up by at least the amount shown, or lower the\n'
+            'demand: a lower profile level, or a narrower band.\n'
+            'Raising Max drive level instead makes the drive clip, and\n'
+            'clipping distortion then sets the level at the rig\'s resonances.')
+        self._limit_lbl.setVisible(False)
+        cl_lay.addWidget(self._limit_lbl)
+
         resp_row = QtWidgets.QHBoxLayout()
         resp_row.addWidget(QtWidgets.QLabel('Speaker response:'))
         resp_row.addStretch()
@@ -902,8 +937,9 @@ class TestProfileDock(QtWidgets.QDockWidget):
             'its own gain on top. With the loop enabled this is a starting\n'
             'point, not a fixed setting — the level servo trims from here to\n'
             'match the measured Grms to demand. The value to the right is the\n'
-            'level actually going to the DAC. Moving the slider re-seeds the\n'
-            'servo, as do Drive On and Reset.'
+            'level actually going to the DAC; it turns orange when it is being\n'
+            'held down by Max drive level (Settings tab). Moving the slider\n'
+            're-seeds the servo, as do Drive On and Reset.'
         )
         self._audio_slider.valueChanged.connect(self._on_audio_level_changed)
         self._ctl.reseed_level(float(self._audio_slider.value()))
@@ -1109,8 +1145,13 @@ class TestProfileDock(QtWidgets.QDockWidget):
         the synthesised block is unit-RMS whatever gain the profile carries.
         Every caller except the servo must also emit drive_changed.
         """
-        out_db = self._ctl.output_dbfs(self.current_gain_db())
+        gain   = self.current_gain_db()
+        out_db = self._ctl.output_dbfs(gain)
         self._audio_level_lbl.setText(f'{out_db:+.1f} dB')
+        # Orange when Max drive level is holding it below what was asked for.
+        self._audio_level_lbl.setStyleSheet(
+            'font-family: Consolas; color: %s;'
+            % ('#fa0' if self._ctl.output_limited(gain) else '#aaa'))
         if self._audio_worker is not None:
             self._audio_worker.set_output_gain(10.0 ** (out_db / 20.0))
 
@@ -1213,6 +1254,17 @@ class TestProfileDock(QtWidgets.QDockWidget):
     def update_loop_idle(self, reason: str) -> None:
         self._ctrl_err_lbl.setText(f'Error RMS: —  ({reason})')
         self._ctrl_err_lbl.setStyleSheet('font-family: Consolas; color: #aaa;')
+        self.update_drive_limit(None)
+
+    def update_drive_limit(self, shortfall_db: Optional[float]) -> None:
+        """Say that the drive is at its limit and how far short, or clear it."""
+        if shortfall_db is None:
+            self._limit_lbl.setVisible(False)
+            return
+        self._limit_lbl.setText(
+            f'DRIVE AT LIMIT ({self._ctl.max_output_dbfs:+.0f} dBFS) — rig is '
+            f'{shortfall_db:.1f} dB short. Turn the amplifier up.')
+        self._limit_lbl.setVisible(True)
 
     def update_spec_status(self, status: Optional[SpecStatus]) -> None:
         """In-spec readout: share of controlled bins inside each tolerance."""
@@ -1421,8 +1473,57 @@ class MainWindow(QtWidgets.QMainWindow):
         self._on_spec_avg_changed(self._spec_avg_spin.value())
 
         layout.addWidget(grp)
+
+        drv  = QtWidgets.QGroupBox('Drive')
+        dfrm = QtWidgets.QFormLayout(drv)
+        self._max_drive_spin = QtWidgets.QDoubleSpinBox()
+        self._max_drive_spin.setRange(*LEVEL_MAX_DBFS_RANGE)
+        self._max_drive_spin.setDecimals(1)
+        self._max_drive_spin.setSingleStep(1.0)
+        self._max_drive_spin.setValue(self._ctl.max_output_dbfs)
+        self._max_drive_spin.setSuffix(' dBFS')
+        self._max_drive_spin.setFixedWidth(120)
+        self._max_drive_lbl = QtWidgets.QLabel()
+        self._max_drive_lbl.setStyleSheet('color: #aaa; font-family: Consolas;')
+        drive_row = QtWidgets.QHBoxLayout()
+        drive_row.addWidget(self._max_drive_spin)
+        drive_row.addWidget(self._max_drive_lbl)
+        drive_row.addStretch()
+        dfrm.addRow('Max drive level:', drive_row)
+        drive_note = QtWidgets.QLabel(
+            'The highest RMS level the PC will send to the amplifier. The level '
+            'servo stops here and shows DRIVE AT LIMIT, with how far short the '
+            'rig is.\n\n'
+            'The drive is Gaussian noise, so its peaks are several times its RMS. '
+            'Above about −12 dBFS those peaks hit the DAC rail. The distortion '
+            'that makes is broadband: it puts energy at the rig\'s resonances no '
+            'matter how far the loop has cut the drive there, so the resonance '
+            'stays hot and the rest of the band is starved. At 0 dBFS a third of '
+            'the samples are clipped and the distortion is only 10 dB down.\n\n'
+            'If the rig cannot reach demand at this level, turn the amplifier '
+            'up. Raise this setting only if the amplifier has nothing left, and '
+            'expect the spectrum to go out of shape when you do.')
+        drive_note.setWordWrap(True)
+        drive_note.setStyleSheet('color: #aaa;')
+        dfrm.addRow(drive_note)
+        self._max_drive_spin.valueChanged.connect(self._on_max_drive_changed)
+        self._on_max_drive_changed(self._max_drive_spin.value())
+        layout.addWidget(drv)
+
         layout.addStretch()
         return widget
+
+    def _on_max_drive_changed(self, dbfs: float) -> None:
+        self._ctl.max_output_dbfs = float(dbfs)
+        frac, sdr = gaussian_clip(dbfs)
+        self._max_drive_lbl.setText(
+            f'clips {frac * 100:.3g} % of samples   '
+            f'(distortion {sdr:.0f} dB below the drive)')
+        # Not there yet while the settings tab is first being built.
+        dock = getattr(self, '_profile_dock', None)
+        if dock is not None:
+            dock._apply_level()
+            self._stream.restart_control_window()   # the drive level may have jumped
 
     def _on_spec_avg_changed(self, n: int) -> None:
         self._assessor.n_avg = n
@@ -1743,6 +1844,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._profile_dock.update_spec_status(None)
         self._profile_dock._ctrl_err_lbl.setText('Error RMS: —')
         self._profile_dock._ctrl_err_lbl.setStyleSheet('font-family: Consolas; color: #aaa;')
+        self._profile_dock.update_drive_limit(None)
         self._drive_curve.setVisible(False)
 
     def _apply_correction(self) -> None:
@@ -1765,6 +1867,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_drive_stopped(self) -> None:
         self._assessor.reset()
         self._profile_dock.update_spec_status(None)
+        self._profile_dock.update_drive_limit(None)
 
     @QtCore.pyqtSlot(str)
     def _on_drive_failed(self, message: str) -> None:
@@ -1799,7 +1902,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     self, 'Load speaker response',
                     f'No saved response found at:\n{RESPONSE_FILE}')
             return
-        # The file is checked against the clamp the loop is running with now.
+        # The file is checked against the clamp the loop is running with now
+        # (boost up to Max corr, cut down to CTRL_MAX_CUT_DB).
         self._ctl.max_boost_db = self._profile_dock.max_correction_db
         try:
             self._ctl.load_response(RESPONSE_FILE)
@@ -1999,6 +2103,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dock._apply_level()
         dock.push_correction(self._plot_freqs, out.corr_db)
         dock.update_loop_error(out.err_rms_db, out.sat_frac)
+        dock.update_drive_limit(out.shortfall_db if out.at_limit else None)
 
         # Correction trace on the right-hand dB axis: how hard each frequency
         # is being pushed relative to the profile. Once converged this is the

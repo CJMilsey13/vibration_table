@@ -192,6 +192,8 @@ Outputs `icm42688_streamer.uf2` — drag-and-drop to flash.
 | `TOL_ALARM_DB` / `TOL_ABORT_DB` | 3 / 6 dB | Tolerance bands drawn around the demand profile |
 | `SPEC_AVG_DEFAULT` | 8 windows | Control windows averaged for the in-spec verdict (Settings tab, 1–32) |
 | `RESPONSE_MAX_CLAMPED_FRAC` | 5 % | A saved response with more of its bins outside the clamp is refused |
+| `LEVEL_MAX_DBFS_DEFAULT` | −12 dBFS | Highest RMS the level servo will send to the DAC (Settings tab, −20…0) |
+| `CLIP_FRACTION` | 0.5 % | Share of a block's samples on the rail before `CLIP` is shown |
 | `CTRL_DEADBAND_DB` | 0.5 dB | Soft deadband ≈1σ of the smoothed estimate |
 | `CTRL_MAX_STEP_DB` | 6.0 dB | Per-update slew limit on the correction |
 | `BATCH` | 80 | Samples per Qt signal emission |
@@ -360,7 +362,13 @@ Third plot pane, below the spectrum: demand vs. achieved overall level over the 
   **It clamps frequency into the breakpoint range**, so it returns the *edge* level
   outside the profile — never zero. Callers must band-limit themselves.
 - `_generate_shaped_block`: IFFT method — amplitude per bin = `sqrt(PSD(f) * df)`, random phase
-- **MUST synthesise only inside `[max(PSD_FMIN, bp[0]), min(PSD_FMAX, bp[-1], fs/2)]`.**
+- **MUST synthesise only inside `[max(PSD_FMIN, bp[0]), min(PSD_FMAX, bp[-1], fs/2)]`,
+  plus half a drive bin (`fs/n/2` ≈ 5 Hz) of slack at each end.** The slack is there so
+  the band is driven right to its edges: a drive bin is ~11 Hz wide, and stopping at the
+  last bin *centre* inside the band left the top few Hz with no drive (−4.2 dB at
+  1996–2000 Hz). The loop then wound those bins toward the boost rail — the spike at the
+  right-hand end of the correction curve. A slack bin takes the band-edge correction
+  (the lookup frequency is clamped into the band), never the 0 dB taper.
   Because the block is normalised to unit RMS, any out-of-band energy directly steals
   level from the in-band signal. Emitting to Nyquist on a flat 20–2000 Hz profile puts
   only 8.9 % of the power in-band (−10.5 dB).
@@ -375,9 +383,12 @@ Third plot pane, below the spectrum: demand vs. achieved overall level over the 
   +6.00 dB at the DAC.
 - The label beside the Level slider shows the level **going to the DAC** (slider/servo
   level + step gain), not the slider position.
-- Clip detection: hard-clips at ±1.0 and fires `clip_detected` for **every** clipping
-  block; each one restarts the 2 s clear timer, so the red "CLIP" stays lit for as long
-  as clipping continues. (It used to fire on the first block only and vanish after 2 s.)
+- Clip detection: always hard-clips at ±1.0, and fires `clip_detected` for **every**
+  block with more than `CLIP_FRACTION` (0.5 %) of its samples on the rail; each one
+  restarts the 2 s clear timer, so the red "CLIP" stays lit for as long as clipping
+  continues. One flattened 4σ peak in a block is not reported — that is what −12 dBFS
+  looks like and it is 50 dB down. In practice `CLIP` means the drive is above about
+  −10 dBFS RMS.
 
 ### Test sequence behaviour
 - Clicking **▶ Start** in Test Control:
@@ -537,6 +548,65 @@ If the loop ever appears to "do nothing for tens of seconds", check whether the
 correction is winding uniformly — that is the signature of a level error reaching
 the shape loop, and it means the split has been broken.
 
+### The drive ceiling — the level servo must not drive into clipping
+
+The drive is Gaussian noise, so its peaks run far above its RMS. At an RMS of L dBFS
+everything beyond `10^(−L/20)` σ is flattened by the DAC:
+
+| RMS level | clips at | samples clipped | distortion below the drive |
+|---|---|---|---|
+| 0 dBFS | 1.0 σ | 31.7 % | 10 dB |
+| −6 dBFS | 2.0 σ | 4.6 % | 20 dB |
+| −9.5 dBFS | 3.0 σ | 0.28 % | 34 dB |
+| **−12 dBFS** | 4.0 σ | 0.007 % | 52 dB |
+
+(`control.gaussian_clip`, checked against a brute-force clip of 2 M samples.)
+
+**Clipping distortion is broadband — it lands in every bin whatever that bin was asked
+to carry.** This rig's response spans about 35 dB (a resonance near 80 Hz against a weak
+top end), so flattening it means cutting the drive ~30 dB at the resonance. Distortion
+only 10–20 dB below the drive then sets the level at the resonance, not the loop. That
+is the "energy the loop cannot cut" described under the asymmetric clamp — made by the
+drive itself.
+
+So the level servo stops at `SpectralController.max_output_dbfs` (default −12 dBFS,
+**Settings → Max drive level**), and `output_dbfs()` never exceeds it whatever the
+slider or a sequence step asks for. When the servo is on that ceiling and the rig is
+still below demand, `ControlUpdate.at_limit` is set and the dock shows, in red:
+
+```
+DRIVE AT LIMIT (−12 dBFS) — rig is 14.1 dB short. Turn the amplifier up.
+```
+
+The figure is the level error at the ceiling: exactly how much more gain the amplifier
+has to supply. The Level label turns orange whenever the ceiling is holding the output
+below what the slider + step gain asked for.
+
+Seen in the field (`1008 debug 2.png`): Level `+0.0 dB`, `CLIP`, measured Grms flat at
+0.28 g through −12 / −8 / −6 dB steps demanding 0.35 / 0.56 / 0.71 g, resonance band the
+hottest part of the spectrum although its correction was the deepest cut. Reproduced in
+`tests/test_closed_loop.py` with the real synthesis and real clipping against a rig with
+a 35 dB resonance and too little gain:
+
+| | ceiling 0 dBFS (old) | ceiling −12 dBFS | −12 dBFS, amplifier +15 dB |
+|---|---|---|---|
+| Measured at the −12 / −8 / −6 dB steps (demand 0.353 / 0.560 / 0.705 g) | 0.35 / 0.43 / 0.42 | 0.14 / 0.14 / 0.14 | 0.352 / 0.561 / 0.702 |
+| Samples clipped | 23 % | 0.005 % | 0.0001 % |
+| Resonance vs. rest of band | **+8 dB**, cut on the −40 dB rail | +0.3…+1.2 dB | +0.3…+1.2 dB |
+| Readout | CLIP, `sat` | `DRIVE AT LIMIT … 14 dB short` | in spec |
+
+Two things to read from that table. Driving into clipping does buy level (0.42 g against
+0.14 g) — but not the level asked for, and it loses the shape. And the steps add nothing
+in either limited case: once the output is on a ceiling, a step's feedforward is clamped.
+**A flat Grms across sequence steps means the drive is at a limit, not that the step
+logic is broken.**
+
+- Do not raise the default ceiling to "get more power". The fix for too little level is
+  amplifier gain, or a lower / narrower profile.
+- `max_boost_db` (Max corr) limits **boost only**. The cut rail is always
+  `CTRL_MAX_CUT_DB`. It used to be `min(Max corr, 40)`, so the default 20 dB could not
+  cut a 30 dB resonance and left it ~3 dB proud.
+
 ### The loop must not integrate without a drive
 
 `SpectralController.update(..., drive_active)` — `drive_active` is a **required**
@@ -688,6 +758,10 @@ PyOpenGL>=3.1
 | editingFinished + setText infinite loop | Qt5 double-fire bug | Use only `returnPressed`, not `editingFinished` |
 | Loop pinned at max correction, error RMS stuck ~30 dB, measured PSD far below target everywhere | Drive synthesised out to Nyquist (`psd_interp_loglog` clamps, doesn't roll off) **and** correction held its saturated edge value past 4 kHz. Out-of-band power dominated the unit-RMS normalisation and crushed the in-band level by ≈42 dB — a positive-feedback runaway | Band-limit synthesis to the profile band; taper correction to 0 dB outside the control band; confine the loop's error/clamp to the profile band |
 | Control loop oscillates, spiky drive curve | Loop gain too high for a pure integral controller with noisy Welch bins | Error smoothed with `gaussian_filter1d(sigma=5)` before integrating |
+| Measured Grms does not follow sequence steps; Level reads the ceiling; `DRIVE AT LIMIT` | The rig needs more level than the PC may send (Max drive level, default −12 dBFS) | Turn the amplifier up by at least the shortfall shown, or lower / narrow the profile. Not a software fault |
+| Level `+0.0 dB`, `CLIP`, resonance stays hot though its correction is on the cut rail, `sat` | Max drive level raised to 0 dBFS: a third of samples clip and the distortion feeds the resonance | Put Max drive level back to −12 dBFS and add amplifier gain |
+| Spike at the top edge of the correction curve | Top few Hz of the band had no drive (last drive bin centre is below the edge) | Synthesis covers the band to its edges, half a drive bin of slack |
+| A resonance stays ~3 dB proud with Max corr at 20 dB | Cut rail was tied to Max corr | Cut rail is always 40 dB |
 | Level creeps to 0 dB with the drive off; full-scale burst on Drive On | Level servo integrated ambient noise | `update(..., drive_active=False)` integrates nothing; Drive On re-seeds from the slider |
 | Shaker gets louder after Stop / at test end | Drive kept running while demand reverted to 0 dB | Stop and completion stop the drive |
 | +5 dB overshoot and CLIP right after a sequence step or Drive On | Control window held data from before the change, so the change was "corrected" a second time | `restart_control_window()` on every external drive change |

@@ -17,14 +17,32 @@ def test_block_is_unit_rms_whatever_gain_the_profile_carries(iv, rng):
         assert np.sqrt(np.mean(sig.astype(np.float64) ** 2)) == pytest.approx(1.0, abs=1e-5)
 
 
-def test_block_is_confined_to_the_profile_band(iv, rng):
-    n, fs = 4096, 44100
+@pytest.mark.parametrize('fs', [44100, 48000, 96000])
+def test_block_is_confined_to_the_profile_band(iv, rng, fs):
+    n     = 4096
+    half  = 0.5 * fs / n                             # half a drive bin
     spec  = np.zeros(n // 2 + 1)
     for _ in range(50):
         spec += np.abs(np.fft.rfft(iv._generate_shaped_block(PROFILE, 0.0, n, fs, rng))) ** 2
     f = np.fft.rfftfreq(n, 1 / fs)
-    inside = spec[(f >= 20) & (f <= 2000)].sum()
-    assert inside / spec.sum() > 0.9999
+    inside = spec[(f >= 20 - half) & (f <= 2000 + half)].sum()
+    assert inside / spec.sum() > 0.9999              # nothing beyond half a bin of slack
+    assert spec[f > 2000 + half].sum() / spec.sum() < 1e-6    # and nothing toward Nyquist
+
+
+@pytest.mark.parametrize('fs', [44100, 48000])
+def test_drive_reaches_the_edges_of_the_band(iv, rng, fs):
+    """The top few Hz of the band used to get no drive: the last drive bin
+    centred inside 20–2000 Hz is at 1992 Hz and covers only to ~1998 Hz. The
+    loop then wound those bins toward the boost rail."""
+    x = np.concatenate([iv._generate_shaped_block(PROFILE, 0.0, 4096, fs, rng)
+                        for _ in range(600)]).astype(np.float64)
+    from scipy.signal import welch
+    f, p = welch(x, fs=fs, nperseg=fs, noverlap=fs // 2)        # 1 Hz bins, like the host
+    mid  = p[(f >= 1800) & (f <= 1950)].mean()
+    for lo, hi in ((1996, 2000), (20, 24)):
+        edge = p[(f >= lo) & (f <= hi)].mean()
+        assert 10 * np.log10(edge / mid) > -1.5, (lo, hi)       # was -4.2 dB at the top
 
 
 def test_correction_shapes_the_block_and_tapers_outside_its_span(iv, rng):
@@ -68,3 +86,21 @@ def test_every_clipping_block_is_flagged(iv, rng):
 
     w.set_output_gain(0.1)                           # -20 dB: 10 sigma of headroom
     assert not any(w.render(4096, rng)[1] for _ in range(200))
+
+
+def test_clip_flag_means_distortion_not_one_stray_peak(iv, rng):
+    w = iv.AudioOutputWorker()
+    w.set_profile(PROFILE, 0.0)
+    # At the default ceiling the odd 4-sigma peak is flattened — about one
+    # sample in 15 000, 50 dB down. That is not what the indicator is for.
+    w.set_output_gain(10 ** (-12 / 20))
+    blocks = [w.render(4096, rng) for _ in range(400)]
+    assert not any(clipped for _, clipped in blocks)
+    assert max(float(np.max(np.abs(sig))) for sig, _ in blocks) <= 1.0     # still hard-limited
+    # 3 dB hotter, 0.5 % of samples clip (distortion ~30 dB down): flagged in
+    # enough blocks to hold the indicator on, which needs one every 2 s.
+    w.set_output_gain(10 ** (-9 / 20))
+    assert sum(w.render(4096, rng)[1] for _ in range(400)) > 80
+    # By -6 dBFS (4.6 % clipped, 20 dB down) it is every block.
+    w.set_output_gain(10 ** (-6 / 20))
+    assert all(w.render(4096, rng)[1] for _ in range(100))

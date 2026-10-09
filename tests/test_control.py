@@ -10,11 +10,13 @@ import numpy as np
 import pytest
 
 from control import (
-    CTRL_MAX_CUT_DB, LEVEL_MIN_DB, ResponseError, SpecAssessor,
-    SpectralController, band_grms, band_mask, breakpoint_error, psd_grms,
-    psd_interp_loglog,
+    CTRL_MAX_CUT_DB, LEVEL_MAX_DBFS_DEFAULT, LEVEL_MIN_DB, ResponseError,
+    SpecAssessor, SpectralController, band_grms, band_mask, breakpoint_error,
+    gaussian_clip, psd_grms, psd_interp_loglog,
 )
-from sim import FREQS, PROFILE, SimRig, flat_plant_db, measure, on_target
+from sim import (
+    FREQS, PROFILE, START_DBFS, SimRig, controller, flat_plant_db, measure, on_target,
+)
 
 BAND = band_mask(FREQS, PROFILE)
 
@@ -67,7 +69,7 @@ def test_level_error_is_unbiased_on_target(rng):
 
 def test_converged_rig_runs_at_demand_not_above_it(rng):
     rig = SimRig(np.full(len(FREQS), flat_plant_db(9.0)), rng)
-    ctl = SpectralController(FREQS)
+    ctl = controller()
     run_loop(ctl, rig, 12)
     # True in-band power of the rig once settled, against demand.
     true   = rig.true_psd(ctl.corr_db, ctl.output_dbfs(0.0))
@@ -82,7 +84,7 @@ def test_cold_start_nine_db_low_converges(rng):
     """CLAUDE.md, 'Two loops': split level + shape settles in ~6 s with a
     peak correction of a few dB, where the single loop never did."""
     rig = SimRig(np.full(len(FREQS), flat_plant_db(9.0)), rng)
-    ctl = SpectralController(FREQS)
+    ctl = controller()
     outs = run_loop(ctl, rig, 8)
     assert abs(outs[3].common_db) < 0.5             # 4th update = 6 s of data
     assert all(abs(o.common_db) < 0.5 for o in outs[3:])
@@ -93,7 +95,7 @@ def test_cold_start_nine_db_low_converges(rng):
 def test_tilted_plant_is_flattened(rng):
     tilt = -12.0 * np.log10(np.maximum(FREQS, 20.0) / 20.0) / 2.0   # -12 dB over 20→2000 Hz
     rig  = SimRig(flat_plant_db(3.0) + tilt, rng)
-    ctl  = SpectralController(FREQS)
+    ctl = controller()
     outs = run_loop(ctl, rig, 15)
     assert outs[-1].err_rms_db < 1.5
     # The correction learned is the inverse of the plant's tilt (up to a
@@ -115,7 +117,7 @@ def test_error_readout_is_low_on_a_perfect_signal(rng):
 
 def test_gain_step_moves_output_by_the_step_and_needs_no_relearning(rng):
     rig = SimRig(np.full(len(FREQS), flat_plant_db(4.0)), rng)
-    ctl = SpectralController(FREQS)
+    ctl = controller()
     run_loop(ctl, rig, 8, gain_db=-6.0)
     before = ctl.output_dbfs(-6.0)
     assert ctl.output_dbfs(0.0) - before == pytest.approx(6.0)
@@ -123,14 +125,61 @@ def test_gain_step_moves_output_by_the_step_and_needs_no_relearning(rng):
     assert abs(out.common_db) < 0.5
 
 
-def test_output_never_exceeds_full_scale(rng):
-    rig = SimRig(np.full(len(FREQS), flat_plant_db(40.0)), rng)   # rig cannot reach demand
-    ctl = SpectralController(FREQS)
+def test_drive_stops_at_the_ceiling_and_says_how_far_short(rng):
+    """'1008 debug 2': the rig needs more than the DAC can cleanly give."""
+    short = 7.0                                      # rig needs 7 dB more than the ceiling
+    rig = SimRig(np.full(len(FREQS), flat_plant_db(short, at_dbfs=LEVEL_MAX_DBFS_DEFAULT)), rng)
+    ctl = controller()
+    outs = run_loop(ctl, rig, 14)
+    assert ctl.output_dbfs(0.0) == LEVEL_MAX_DBFS_DEFAULT        # on the ceiling, not past it
+    assert outs[-1].at_limit
+    assert outs[-1].shortfall_db == pytest.approx(short, abs=0.3)   # what the amplifier must add
+    assert not outs[0].at_limit                      # not while it still had room to climb
+    # The shape loop is unaffected: it goes on flattening what the rig can give.
+    assert np.max(np.abs(ctl.corr_db)) < 5.0 and outs[-1].sat_frac == 0.0
+
+
+def test_a_step_up_from_the_ceiling_adds_nothing(rng):
+    rig = SimRig(np.full(len(FREQS), flat_plant_db(2.0, at_dbfs=LEVEL_MAX_DBFS_DEFAULT)), rng)
+    ctl = controller()
+    run_loop(ctl, rig, 12, gain_db=-12.0)            # needs ceiling - 10 dB: fine
+    assert not run_loop(ctl, rig, 1, gain_db=-12.0)[0].at_limit
+    before = ctl.output_dbfs(-12.0)
+    assert ctl.output_dbfs(-6.0) - before == pytest.approx(6.0)     # room for this step
+    assert ctl.output_dbfs(0.0) == LEVEL_MAX_DBFS_DEFAULT           # ...but not for this one
+    assert ctl.output_limited(0.0) and not ctl.output_limited(-6.0)
+    out = run_loop(ctl, rig, 4, gain_db=0.0)[-1]
+    assert out.at_limit and out.shortfall_db == pytest.approx(2.0, abs=0.3)
+
+
+def test_ceiling_holds_at_every_gain_and_can_be_moved(rng):
+    rig = SimRig(np.full(len(FREQS), flat_plant_db(40.0)), rng)   # hopeless rig
+    ctl = controller()
     for gain_db in (-6.0, 0.0, 6.0):
         run_loop(ctl, rig, 12, gain_db=gain_db)
-        assert ctl.output_dbfs(gain_db) <= 0.0
-        assert ctl.level_db <= -gain_db + 1e-9      # servo stopped at the rail
+        assert ctl.output_dbfs(gain_db) == LEVEL_MAX_DBFS_DEFAULT
+        assert ctl.level_db <= LEVEL_MAX_DBFS_DEFAULT - gain_db + 1e-9   # servo stopped at the rail
     assert ctl.level_db >= LEVEL_MIN_DB
+    ctl.max_output_dbfs = -3.0                       # operator's choice, on the Settings tab
+    run_loop(ctl, rig, 6, gain_db=0.0)
+    assert ctl.output_dbfs(0.0) == -3.0
+
+
+def test_gaussian_clip_table():
+    """The figures quoted in control.py and on the Settings tab."""
+    for dbfs, frac, sdr in ((0.0, 0.317, 9.7), (-6.0, 0.046, 19.8),
+                            (-9.5, 0.0028, 33.7), (-12.0, 6.9e-5, 51.7)):
+        f, s_ = gaussian_clip(dbfs)
+        assert f == pytest.approx(frac, rel=0.03) and s_ == pytest.approx(sdr, abs=0.3)
+    # ...and against a brute-force clip of real Gaussian samples.
+    x = np.random.default_rng(0).normal(size=2_000_000)
+    for dbfs in (0.0, -6.0):
+        k = 10 ** (-dbfs / 20)
+        y = np.clip(x, -k, k)
+        alpha = np.dot(x, y) / np.dot(x, x)
+        sdr = 10 * np.log10(alpha ** 2 * np.mean(x ** 2) / np.mean((y - alpha * x) ** 2))
+        assert gaussian_clip(dbfs)[1] == pytest.approx(sdr, abs=0.2)
+        assert gaussian_clip(dbfs)[0] == pytest.approx(np.mean(np.abs(x) > k), rel=0.02)
 
 
 def test_reseed_level(rng):
@@ -139,14 +188,18 @@ def test_reseed_level(rng):
     assert ctl.level_db == -33.0 and ctl.output_dbfs(-6.0) == -39.0
     ctl.reseed_level(+12.0)
     assert ctl.level_db == 0.0
+    # The slider can sit above the ceiling; the DAC still does not go there.
+    assert ctl.output_dbfs(0.0) == LEVEL_MAX_DBFS_DEFAULT and ctl.output_limited(0.0)
+    assert ctl.output_dbfs(-20.0) == -20.0 and not ctl.output_limited(-20.0)
 
 
 # ── Clamp and anti-windup (CLAUDE.md, 'Why the clamp is asymmetric') ─────────
 
 def test_resonance_fed_by_the_whole_band_cannot_wind_the_cut(rng):
-    # At -20 dBFS the resonance sits ~10 dB above demand whatever is driven there.
-    rig = SimRig(np.full(len(FREQS), flat_plant_db(0.0)), rng, coupling=0.5)
-    ctl = SpectralController(FREQS)
+    # At the start level the resonance sits ~10 dB above demand whatever is driven there.
+    rig = SimRig(np.full(len(FREQS), flat_plant_db(0.0)), rng,
+                 coupling=0.5 * 10 ** (-(START_DBFS + 20.0) / 10))
+    ctl = controller()
     ctl.max_boost_db = 200.0                        # boost ceiling must not matter
     outs = run_loop(ctl, rig, 40)
     assert ctl.corr_db.min() == pytest.approx(-CTRL_MAX_CUT_DB)   # on the rail, not past it
@@ -156,16 +209,29 @@ def test_resonance_fed_by_the_whole_band_cannot_wind_the_cut(rng):
     assert np.max(np.abs(ctl.corr_db[away])) < 10.0
 
 
+def test_default_boost_limit_does_not_limit_the_cut(rng):
+    """Max corr is a BOOST ceiling. A 30 dB resonance must still be cut flat
+    with it at the default 20 dB."""
+    resonance = 30.0 * np.exp(-0.5 * ((FREQS - 300.0) / 40.0) ** 2)
+    rig = SimRig(flat_plant_db(3.0) + resonance, rng)
+    ctl = controller()
+    assert ctl.max_boost_db == 20.0 and ctl.limits_db == (-CTRL_MAX_CUT_DB, 20.0)
+    outs = run_loop(ctl, rig, 20)
+    assert ctl.corr_db.min() < -24.0                 # went well past -20
+    assert ctl.corr_db.max() <= 20.0
+    assert outs[-1].err_rms_db < 1.5 and outs[-1].sat_frac == 0.0
+
+
 def test_correction_is_zero_outside_the_profile_band(rng):
     rig = SimRig(np.full(len(FREQS), flat_plant_db(9.0)), rng)
-    ctl = SpectralController(FREQS)
+    ctl = controller()
     run_loop(ctl, rig, 6)
     assert not np.any(ctl.corr_db[~BAND])
 
 
 def test_reset_returns_to_base_not_flat(rng, tmp_path):
     rig = SimRig(flat_plant_db(3.0) - 6.0 * (FREQS > 500), rng)
-    ctl = SpectralController(FREQS)
+    ctl = controller()
     run_loop(ctl, rig, 10)
     ctl.save_response(tmp_path / 'r.json')
     base = ctl.base_db
@@ -223,7 +289,7 @@ def test_sane_response_loads_clamped_and_tapered(tmp_path):
 
 def test_save_then_load_round_trips(rng, tmp_path):
     rig = SimRig(flat_plant_db(3.0) - 6.0 * (FREQS > 500), rng)
-    ctl = SpectralController(FREQS)
+    ctl = controller()
     run_loop(ctl, rig, 10)
     ctl.save_response(tmp_path / 'r.json')
     other = SpectralController(FREQS)

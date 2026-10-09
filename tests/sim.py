@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.signal import welch
 
-from control import psd_interp_loglog
+from control import SpectralController, psd_interp_loglog
 from stream import CTRL_SAMPLES, PSD_FMAX, PSD_FMIN, SAMPLE_RATE, SPEC_N
 
 FULL_FREQS = np.fft.rfftfreq(SPEC_N, 1.0 / SAMPLE_RATE)
@@ -84,8 +84,22 @@ class SimRig:
         return measure(self.true_psd(corr_db, out_dbfs), self.rng)
 
 
-def flat_plant_db(deficit_db: float, profile=PROFILE) -> float:
-    """Plant gain that leaves the rig deficit_db below demand at -20 dBFS."""
+# Where the simulated tests start the drive. Low enough that a rig 10–15 dB
+# short of demand is still reached well below the controller's drive ceiling —
+# these rigs have an amplifier with gain to spare. Tests about running OUT of
+# drive build their rig against the ceiling instead.
+START_DBFS = -30.0
+
+
+def flat_plant_db(deficit_db: float, profile=PROFILE, at_dbfs: float = START_DBFS) -> float:
+    """Plant gain that leaves the rig deficit_db below demand at at_dbfs."""
     band   = (FREQS >= profile[0][0]) & (FREQS <= profile[-1][0])
     demand = float(np.sum(psd_interp_loglog(FREQS, profile)[band]))
-    return 10.0 * np.log10(demand) + 20.0 - deficit_db
+    return 10.0 * np.log10(demand) - at_dbfs - deficit_db
+
+
+def controller() -> SpectralController:
+    """A controller with its level seeded at START_DBFS."""
+    ctl = SpectralController(FREQS)
+    ctl.reseed_level(START_DBFS)
+    return ctl

@@ -57,6 +57,36 @@ CTRL_LEVEL_MAX_STEP_DB = 6.0    # real physical level change — worth slew-limi
 LEVEL_MIN_DB           = -80.0
 LEVEL_DEFAULT_DB       = -20.0  # safe start
 
+# The drive is Gaussian noise, so its peaks run far above its RMS. Sent to the
+# DAC at an RMS of L dBFS, every sample beyond 10^(-L/20) sigma is flattened:
+#
+#     RMS level   clips at   samples clipped   distortion below the signal
+#       0 dBFS     1.0 σ        31.7 %                 10 dB
+#      -6 dBFS     2.0 σ         4.6 %                 20 dB
+#     -9.5 dBFS    3.0 σ         0.27 %                34 dB
+#     -12 dBFS     4.0 σ         0.006 %               51 dB
+#
+# Clipping distortion is broadband: it lands in every bin whatever that bin was
+# asked to carry. A rig whose response spans 35 dB needs the drive cut 35 dB at
+# its resonance — and distortion only 10–20 dB down then sets the level there,
+# not the loop. That is "energy the loop cannot cut", made by the drive itself.
+# So the level servo stops here, and reports that it has, instead of driving
+# into the rail. More level has to come from the amplifier.
+LEVEL_MAX_DBFS_DEFAULT = -12.0
+LEVEL_MAX_DBFS_RANGE   = (-20.0, 0.0)
+LEVEL_LIMIT_MARGIN_DB  = 0.5    # shortfall below this is not worth reporting
+
+
+def gaussian_clip(level_dbfs: float) -> tuple[float, float]:
+    """(fraction of samples clipped, signal-to-distortion in dB) for Gaussian
+    noise sent to a ±1.0 DAC at an RMS of level_dbfs."""
+    k = 10.0 ** (-level_dbfs / 20.0)                    # clip point, in sigma
+    frac  = math.erfc(k / math.sqrt(2.0))
+    alpha = math.erf(k / math.sqrt(2.0))                # gain of the undistorted part
+    power = alpha - k * math.sqrt(2.0 / math.pi) * math.exp(-k * k / 2.0) + k * k * frac
+    dist  = max(power - alpha * alpha, 1e-30)
+    return frac, 10.0 * math.log10(alpha * alpha / dist)
+
 # Tolerance bands drawn around the demand profile (dB power), the usual way a
 # random-vibration run is judged in or out of spec.
 TOL_ALARM_DB = 3.0
@@ -228,6 +258,8 @@ class ControlUpdate:
     common_db:  float        # level error: demand/measured in-band power, dB
     err_rms_db: float        # level error ⊕ smoothed shape error — what the loop acts on
     sat_frac:   float        # share of in-band bins on either rail
+    at_limit:   bool  = False  # level servo is on its ceiling and still short
+    shortfall_db: float = 0.0  # ...by this much: what the amplifier must add
 
 
 class SpectralController:
@@ -253,6 +285,7 @@ class SpectralController:
         self._level_db = LEVEL_DEFAULT_DB
         self.loop_gain    = 0.5    # fraction of the dB error applied per update
         self.max_boost_db = 20.0   # boost ceiling; cut is capped at CTRL_MAX_CUT_DB
+        self.max_output_dbfs = LEVEL_MAX_DBFS_DEFAULT   # highest RMS sent to the DAC
 
     # ── Level ─────────────────────────────────────────────────────────────────
 
@@ -265,8 +298,12 @@ class SpectralController:
         self._level_db = max(LEVEL_MIN_DB, min(0.0, float(level_db)))
 
     def output_dbfs(self, gain_db: float) -> float:
-        """Drive level for a step at gain_db. Never above full scale."""
-        return max(LEVEL_MIN_DB, min(0.0, self._level_db + gain_db))
+        """Drive level for a step at gain_db. Never above max_output_dbfs."""
+        return max(LEVEL_MIN_DB, min(self.max_output_dbfs, self._level_db + gain_db))
+
+    def output_limited(self, gain_db: float) -> bool:
+        """True if output_dbfs() is being held down by max_output_dbfs."""
+        return self._level_db + gain_db > self.max_output_dbfs + 1e-9
 
     # ── Correction ────────────────────────────────────────────────────────────
 
@@ -280,8 +317,15 @@ class SpectralController:
 
     @property
     def limits_db(self) -> tuple[float, float]:
-        """(cut, boost) rails. Asymmetric — see CTRL_MAX_CUT_DB."""
-        return -min(self.max_boost_db, CTRL_MAX_CUT_DB), self.max_boost_db
+        """(cut, boost) rails. Asymmetric — see CTRL_MAX_CUT_DB.
+
+        max_boost_db limits BOOST only. The cut rail is always CTRL_MAX_CUT_DB,
+        whatever the boost setting: cutting is the safe direction, and a rig
+        with a 35 dB resonance needs about 30 dB of it even when 20 dB of
+        boost is plenty. (The cut used to be min(max_boost, 40), so the default
+        20 dB setting left such a resonance standing 3 dB proud.)
+        """
+        return -CTRL_MAX_CUT_DB, self.max_boost_db
 
     def reset(self) -> None:
         """Discard what the loop has learned. Falls back to the saved speaker
@@ -335,12 +379,18 @@ class SpectralController:
                                  common, err_rms, self._sat_frac(band, lo, hi))
 
         # Level servo. Slew-limited because it is a real physical level change.
-        # The ceiling keeps level + gain at or below full scale, and stops the
-        # servo integrating into a rail it is already on.
+        # The ceiling keeps level + gain at or below max_output_dbfs — short of
+        # where the drive would clip — and stops the servo integrating into a
+        # rail it is already on.
+        ceiling = self.max_output_dbfs - gain_db
         self._level_db = max(LEVEL_MIN_DB, min(
-            -gain_db,
+            ceiling,
             self._level_db + float(np.clip(
                 common, -CTRL_LEVEL_MAX_STEP_DB, CTRL_LEVEL_MAX_STEP_DB))))
+        # On the ceiling and still below demand: the rig needs more than the
+        # DAC can cleanly give. `common` is exactly how much more.
+        at_limit = (self._level_db >= ceiling - 1e-9
+                    and common > LEVEL_LIMIT_MARGIN_DB)
 
         # Soft deadband: shrink toward zero rather than hard-gating, so the
         # correction stops random-walking on measurement noise once
@@ -381,7 +431,8 @@ class SpectralController:
         self._corr[~band] = 0.0
 
         return ControlUpdate(True, self._level_db, self._corr.copy(), band,
-                             common, err_rms, self._sat_frac(band, lo, hi))
+                             common, err_rms, self._sat_frac(band, lo, hi),
+                             at_limit, common if at_limit else 0.0)
 
     def _sat_frac(self, band: np.ndarray, lo: float, hi: float) -> float:
         hc = self._corr[band]
